@@ -1,0 +1,34 @@
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+*.exe
+*.o
+*.so
+
+# Logs
+*.log
