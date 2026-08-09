@@ -1,0 +1,35 @@
+{
+  "name": "ai4se-harness",
+  "version": "1.0.0",
+  "description": "A coding agent harness — deterministic governance, feedback, and tool orchestration for LLM-powered coding agents.",
+  "main": "dist/index.js",
+  "bin": {
+    "harness": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run --dir tests/unit"
+  },
+  "keywords": [
+    "coding-agent",
+    "harness",
+    "llm",
+    "governance"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "commander": "^15.0.0",
+    "openai": "^7.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "express": "^5.2.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

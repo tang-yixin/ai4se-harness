@@ -19,6 +19,74 @@
 - commit 格式：`feat(module): description`，标注 subagent 完成
 - 源码不得出现任何硬编码凭据
 
+## Subagent 通用 Prompt 模板
+
+> 以下为每个 task 派发 subagent 时使用的 prompt 模板。使用时将 `[ ]` 中的内容替换为对应 task 的具体信息。
+
+---
+
+```
+## 项目信息
+
+工作目录：e:\软件工程师训练营\AI4SE_Final_Project\ai4se-harness
+项目类型：TypeScript + Node.js CLI 工具
+测试框架：Vitest（`npx vitest run`）
+项目 SPEC：SPEC.md（在项目根目录）
+项目 PLAN：PLAN.md（在项目根目录，你当前的任务在其中定义）
+
+## 你的任务
+
+Task [N]：[任务名称]
+
+请先阅读 `SPEC.md` 了解项目整体设计，再回到 PLAN.md 阅读你负责的 Task [N] 的完整描述。
+
+## 语言要求
+
+- 与我交流请用中文
+- 代码注释请用中文
+- 代码标识符（变量名、函数名、类型名）用英文
+
+## 重要约束
+
+1. **只能写代码，不要执行 git 命令**。完成代码后告诉我应该执行哪些 git 命令。
+2. **TDD 先行**：先写失败测试 → 运行确认红色 → 再写实现 → 运行确认绿色。
+3. **单元测试零网络依赖**：所有测试用 MockLLMProvider（`src/llm/mock.ts`），不连接真实 API。
+4. **禁止硬编码凭据**：源码中不能出现任何 API key 字面量。
+5. **ESM 模块**：import 使用 `.js` 后缀（如 `import { Tool } from '../core/types.js'`）。
+6. **不要修改 task 范围外的文件**：只动 PLAN.md 中你负责的 "Files" 列表里的文件。
+7. **不要修改已有的公共接口和类型定义**：如果需要改，先问我。
+8. 项目根目录是 `ai4se-harness/`，所有文件路径相对于此。
+
+## 完成后的输出格式
+
+任务完成后，请按以下格式向我报告：
+
+
+### Task [N] 完成
+
+**创建的文件**：
+- src/xxx/xxx.ts
+- tests/unit/xxx.test.ts
+
+**修改的文件**：
+- 无 / src/xxx/xxx.ts（说明改了什么）
+
+**测试结果**：
+- X/Y 通过
+- npx tsc --noEmit：通过 / 失败
+
+**建议的 Git 命令**：
+git checkout -b task/[N]-[description]
+git add [文件列表]
+git commit -m "feat(module): description"
+
+**遇到的问题（如有）**：
+- xxx
+
+```
+
+---
+
 ### Task 0: 项目脚手架与核心类型
 
 **目的：** 搭建项目基础结构，定义所有模块共享的核心类型，让后续 task 可以独立并行开发。
