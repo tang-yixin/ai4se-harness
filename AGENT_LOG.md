@@ -78,7 +78,7 @@ Commit Hash:
 ### 📋 实现 checklist
 
 - [x] Task 0: 项目脚手架与核心类型
-- [ ] Task 1: LLM 抽象层
+- [x] Task 1: LLM 抽象层
 - [ ] Task 2: 配置加载器
 - [ ] Task 3: 凭据存储
 - [ ] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
@@ -99,7 +99,21 @@ Commit Hash:
 ### 📋 Task 0 完成
 
 时间：2026-08-10  
-Task：Task 0 - 项目脚手架与核心类型  
 分支：`task/0-project-scaffold`  
 做了什么：创建 package.json / tsconfig.json / vitest.config.ts / .harnessrc.json / src/core/types.ts，安装依赖，`npx tsc --noEmit` 零错误通过。纯脚手架 + 类型定义，无业务逻辑，一步到位。  
 Commit Hash: `d49a7e7`
+
+---
+
+### 📋 Task 1 完成
+
+时间：2026-08-10  
+Task：Task 1 - LLM 抽象层  
+分支：`task/1-llm-abstraction`  
+做了什么：TDD 三步走（红→绿）实现 LLMProvider 接口 + MockLLMProvider + DeepSeekProvider，4 个测试全部通过，`npx tsc --noEmit` 零错误  
+
+**代码 review 后改进：** `deepseek.ts` 中 JSON.parse 和网络异常原来被同一个 try-catch 兜底，无法区分"该重试"和"该让 LLM 重写"。改为两层独立 try-catch：网络错误 → `content: null`，JSON 解析失败 → `content: "[PARSE_ERROR] ...原始arguments..."`。上层 AgentLoop 后续可按 SPEC §3.1 差异化处理。
+
+**改进时遇到的 bug：** 重构把 `.map()` 换成了 `for...of` 循环，OpenAI SDK v7 的 `ChatCompletionMessageToolCall` 是 discriminated union，`function` 属性不是所有变体都有，TS 直接报错 `Property 'function' does not exist`。修复：加了一层类型断言先尝试取 `function`，没有就 `continue` 跳过。SDK v4 → v7 的类型变化导致的，不影响运行时。
+
+Commit Hash: `19929b6`
