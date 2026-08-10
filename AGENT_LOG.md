@@ -81,7 +81,7 @@ Commit Hash:
 - [x] Task 1: LLM 抽象层
 - [x] Task 2: 配置加载器
 - [x] Task 3: 凭据存储
-- [ ] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
+- [x] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
 - [ ] Task 5: 5 个内置工具
 - [ ] Task 6: 护栏引擎
 - [ ] Task 7: HITL 状态机
@@ -172,4 +172,26 @@ Task：Task 3 - 凭据存储
 - `async` 标记内部全同步调用（`pbkdf2Sync`/`randomBytes`/`writeFileSync` 等）——PLAN 接口约定 `Promise<void>`，保持现状；未来性能敏感时可切换异步版 crypto。
 
 Commit Hash: `e545490`
+
+---
+
+### 📋 Task 4 完成
+
+时间：2026-08-10  
+Task：Task 4 - 工具系统（接口 + 注册 + 分发 + 黑名单）  
+分支：`task/4-tool-system`  
+做了什么：TDD 实现 ToolRegistry + ToolDispatcher（含 JSON Schema 参数校验）+ Blacklist（含 GuardrailViolation 异常），34 个测试全部通过，`npx tsc --noEmit` 零错误，94 个存量测试无回归。
+
+**实现要点：**
+- `ToolRegistry` — Map 存储，register/get/list/toToolDefs，同名覆盖，空注册表安全
+- `ToolDispatcher.dispatch()` — 四步流水线：查找工具 → JSON Schema 参数校验（required + string/number/boolean/array/object 六种类型）→ execute_shell 硬黑名单检查 → 执行。参数校验失败返回 `ExecutionResult`，黑名单命中抛出 `GuardrailViolation`
+- `Blacklist` — 5 个禁止模式的纯正则匹配引擎（rm -rf / / format X: / shutdown|reboot|halt / dd if= / > /dev/sd），大小写不敏感，空/空白命令安全
+- `GuardrailViolation` — 继承 Error，携带被拦截的 `command` 字段，供 Task 6 GuardrailEngine 精确 catch/透传
+
+**代码 review 后的改进：**
+1. **GuardrailViolation 异常** — 原实现黑名单命中返回 `ExecutionResult { success: false }`，调用方无法区分黑名单拦截 vs 参数校验失败。改为 dispatcher 抛出 `GuardrailViolation`，对齐 SPEC §3.3「命中即抛异常」的语义，同时为 Task 6 的 GuardrailEngine 提供显式契约。
+2. **format 模式补全盘符** — `[c-zC-Z]` 实际不匹配 A/B 盘，改为 `[a-zA-Z]` 覆盖全部盘符，测试同步追加 `format A:` / `format B:` 用例。
+3. **dd if= 模式保持 SPEC 原样** — 审核指出 `dd if=/dev/urandom of=/tmp/test` 无害却被拦截，但这是 SPEC 明文定义的「宁可误拦截不可漏过」策略，不改。
+
+Commit Hash: `37c3a13`
 
