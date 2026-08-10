@@ -82,7 +82,7 @@ Commit Hash:
 - [x] Task 2: 配置加载器
 - [x] Task 3: 凭据存储
 - [x] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
-- [ ] Task 5: 5 个内置工具
+- [x] Task 5: 5 个内置工具
 - [ ] Task 6: 护栏引擎
 - [ ] Task 7: HITL 状态机
 - [ ] Task 8: 范围围栏
@@ -194,4 +194,35 @@ Task：Task 4 - 工具系统（接口 + 注册 + 分发 + 黑名单）
 3. **dd if= 模式保持 SPEC 原样** — 审核指出 `dd if=/dev/urandom of=/tmp/test` 无害却被拦截，但这是 SPEC 明文定义的「宁可误拦截不可漏过」策略，不改。
 
 Commit Hash: `37c3a13`
+
+---
+
+### 📋 Task 5 完成
+
+时间：2026-08-10  
+Task：Task 5 - 5 个内置工具  
+分支：`task/5-builtin-tools`  
+做了什么：TDD 实现 list_directory / search_code / read_file / write_file / execute_shell + registerAllTools，46 个新测试 + 94 个存量测试共 140 全部通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- 5 个工具全部实现 `Tool` 接口，riskHint 遵循 SPEC：读操作 low、写操作 medium、shell 执行 high
+- `list_directory` — `readdirSync` + `withFileTypes`，条目前缀 `d`/`-` 区分目录/文件
+- `search_code` — grep 搜索，自动排除 `node_modules`/`dist`/`.git`，grep 不可用时降级到 Windows findstr
+- `read_file` / `write_file` — 标准文件 I/O，write 自动 `mkdirSync` 创建父目录
+- `execute_shell` — `execSync` 封装，失败时保留 stdout/stderr/exitCode
+- `registerAllTools(registry)` — 一键注册全部 5 个工具到 `ToolRegistry`
+
+**测试覆盖（46 个）：** read_file (5)、write_file (8)、round-trip (3)、list_directory (5)、search_code (7)、execute_shell (8)、registerAllTools (6)、通过 ToolDispatcher 分发 (4)
+
+**遇到的技术问题：**
+- TS 7.x + `@types/node` 26.x 中 `ExecSyncOptions.shell` 从 `boolean` 改为 `string`，需传平台 shell 路径
+- grep 默认搜索 `node_modules` 导致超时，添加 `--exclude-dir` 排除
+- 测试搜索模式字符串在测试文件自身中出现导致误匹配，搜索路径从 `.` 改为 `src/`
+
+**代码 review 后改进：**
+1. `getDefaultShell()` 从两份重复定义提取到 `src/core/platform.ts`，消除 DRY
+2. Windows 上优先检测 Git Bash 的 `bash.exe`（POSIX shell，单引号可阻止 `$()` 展开），降低 search_code 的 shell 注入风险
+3. 测试辅助函数 `rmdirSync` → `rmSync`，消除 Node.js DEP0147 弃用警告
+
+Commit Hash: `c075a57`
 
