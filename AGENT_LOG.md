@@ -83,7 +83,7 @@ Commit Hash:
 - [x] Task 3: 凭据存储
 - [x] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
 - [x] Task 5: 5 个内置工具
-- [ ] Task 6: 护栏引擎
+- [x] Task 6: 护栏引擎
 - [ ] Task 7: HITL 状态机
 - [ ] Task 8: 范围围栏
 - [ ] Task 9: 记忆管理
@@ -225,4 +225,42 @@ Task：Task 5 - 5 个内置工具
 3. 测试辅助函数 `rmdirSync` → `rmSync`，消除 Node.js DEP0147 弃用警告
 
 Commit Hash: `c075a57`
+
+---
+
+### 📋 Task 6 完成
+
+时间：2026-08-10  
+Task：Task 6 - 护栏引擎  
+分支：`task/6-guardrails-engine`  
+做了什么：TDD 实现 GuardrailEngine —— 第二层纵深防御的风险评估引擎，76 个新测试 + 140 个存量测试共 216 全部通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- 两层评估架构：① 用户可配置规则（GuardrailRule[]，正则预编译，按顺序优先匹配）→ ② 内置启发式分类
+- `assessRisk(toolName, params)` 返回 `{ level, action?, reason }`：
+  - `level='low'` → 直接放行；`medium` → 记录日志后放行
+  - `level='high'` + `action='deny'` → 拦截；`action='confirm'` → 进入 HITL
+- **execute_shell 三级内置分类**：
+  - 低风险（23 条）：`ls`, `cat`, `git status`, `git diff`, `npx vitest`, `npx tsc` 等纯读命令
+  - 中风险（16 条）：`git add/commit`, `npm install`, `npm test`, `npm run build/test/lint` 等有副作用但安全的命令
+  - 高风险+confirm（12 条）：`sudo`, `rm`, `mkfs`, `fdisk`, `parted`, `chmod`, `chown`, `git push`, `docker`, `systemctl`, `curl|bash`, `wget|bash`
+- **write_file 内置分类**：系统目录检测（`/etc/`, `/var/`, `~/.ssh/` 等 12 个模式）+ 父目录穿越检测（Unix `../` + Windows `..\`）
+- **其他工具**（read_file/list_directory/search_code）：始终 low
+- 未识别命令保守策略 → 默认 `medium`，不盲目放行
+- 跨工具规则隔离：execute_shell 规则不影响 write_file，反之亦然
+
+**测试覆盖（76 个）：** PLAN 7 个基础测试 + 命令分类（23 low + 9 medium + 11 high）+ 路径分类（7）+ 边界条件（12）+ 跨工具隔离（2）+ 分类完整性（3）+ 规则优先级/空参数/超长命令/状态不累积等
+
+**相比 PLAN 参考代码的改进：**
+- PLAN 的 `defaultRisk('execute_shell')` 直接返回 `medium`，与测试 (`ls -la` → `low`) 矛盾；增加了完整的三级内置命令模式表解决
+- PLAN 硬编码所有规则匹配返回 `level: 'high'`；本实现保持了正确的分层逻辑
+- 新增了空命令/空路径防御、Windows 反斜杠穿越检测、mkfs/fdisk/parted 磁盘破坏命令检测
+- `extractSearchableValue` 通过 `typeof` 做类型守卫，防御 params 中值类型不符的情况
+
+**代码 review 后改进：**
+1. `npm test` / `npm run test` 从 LOW 移至 MEDIUM —— 对齐 SPEC §3.3（npm test 会执行脚本，有副作用）
+2. `TRAVERSAL_PATTERNS` 新增 `/\.\.\\/` 覆盖 Windows 反斜杠穿越（`..\..\..\windows\system32`）
+3. HIGH_RISK 新增 `mkfs`/`fdisk`/`parted` 三条底层磁盘破坏命令
+
+Commit Hash: `0e9be4f`
 
