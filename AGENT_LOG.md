@@ -85,7 +85,7 @@ Commit Hash:
 - [x] Task 5: 5 个内置工具
 - [x] Task 6: 护栏引擎
 - [x] Task 7: HITL 状态机
-- [ ] Task 8: 范围围栏
+- [x] Task 8: 范围围栏
 - [ ] Task 9: 记忆管理
 - [ ] Task 10: 决策指纹匹配器
 - [ ] Task 11: 反馈闭环
@@ -292,4 +292,27 @@ Task：Task 7 - HITL 状态机
 - 空 ID 防护：`getRequest('')` 直接返回 undefined，防止空字符串误匹配
 
 Commit Hash: `f9314b5`
+
+---
+
+### 📋 Task 8 完成
+
+时间：2026-08-10  
+Task：Task 8 - 范围围栏（Scope Fence）  
+分支：`task/8-scope-fence`  
+做了什么：TDD 实现 ScopeFenceGuard —— 第三层纵深防御，工作区边界控制。40 个新测试 + 255 个存量测试共 295 全部通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `validatePath(path)` — 将目标路径以 workspaceRoot 为基准解析为绝对路径后，通过 `path.relative()` 判定是否在工作区内。支持 Unix `../` 和 Windows `..\` 两种父目录穿越检测 + Windows 跨盘符检测（`isAbsolute(rel)`）
+- `validateHost(hostOrUrl)` — 从 URL/主机名中提取裸主机名（处理协议、端口、认证信息、路径、query），与白名单精确匹配。IPv6 去方括号处理。子域名不被父域名隐式允许
+- 三个属性访问器：`getWorkspaceRoot()` / `getAllowedHosts()` / `getMaxShellTimeMs()`
+- 空/空白输入统一拒绝
+
+**测试覆盖（40 个）：** PLAN 6 个基础测试 + 边界（空值/纯空白/根目录）+ 越界尝试（深层穿越/跨盘符）+ Windows 路径兼容 + 主机格式（URL/端口/协议/子域名/IPv6）+ 多白名单 + 多次调用状态不累积 + 属性访问器
+
+**代码 review 后改进：**
+1. IPv6 方括号处理：`extractHostname` 中 `[::1]` 提取后去掉方括号变为 `::1`，匹配白名单中的无括号写法
+2. 符号链接穿越：审计指出 `path.resolve()` 不追踪符号链接，判断为接受——GuardrailEngine（第二层）的系统目录检测可兜底
+
+Commit Hash: `1dd42c9`
 
