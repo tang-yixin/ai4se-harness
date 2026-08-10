@@ -84,7 +84,7 @@ Commit Hash:
 - [x] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
 - [x] Task 5: 5 个内置工具
 - [x] Task 6: 护栏引擎
-- [ ] Task 7: HITL 状态机
+- [x] Task 7: HITL 状态机
 - [ ] Task 8: 范围围栏
 - [ ] Task 9: 记忆管理
 - [ ] Task 10: 决策指纹匹配器
@@ -262,5 +262,34 @@ Task：Task 6 - 护栏引擎
 2. `TRAVERSAL_PATTERNS` 新增 `/\.\.\\/` 覆盖 Windows 反斜杠穿越（`..\..\..\windows\system32`）
 3. HIGH_RISK 新增 `mkfs`/`fdisk`/`parted` 三条底层磁盘破坏命令
 
-Commit Hash: `0e9be4f`
+Commit Hash: `be797f2`
+
+---
+
+### 📋 Task 7 完成
+
+时间：2026-08-10  
+Task：Task 7 - HITL 状态机  
+分支：`task/7-hitl-state-machine`  
+做了什么：TDD 实现 HITLStateMachine —— 人机交互审批的有限状态机（WAITING → APPROVED/DENIED/TIMEOUT），39 个新测试 + 216 个存量测试共 255 全部通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- 四个核心状态 + 五条转换路径：submit → WAITING；approve → APPROVED；deny → DENIED；checkTimeout → TIMEOUT
+- `submit(request)` — 强制 status=WAITING + 刷新 createdAt，重复 ID 返回 false 防覆盖
+- `approve(id)` / `deny(id)` — 仅对 WAITING 状态生效，已解析请求二次操作返回 false
+- `checkTimeout()` — 遍历 pending，按 `(now - createdAt) >= timeoutSeconds*1000` 判定超时，幂等
+- `getRequest(id)` — 双向查找（pending → history），WebUI 审批接口依赖此方法
+- `getHistory()` — 按解析顺序保留已处理请求，支持审计追踪
+- 两个可选回调：`onRequest`（新请求到达）、`onResolved`（请求被解析，含终态 status）
+
+**测试覆盖（39 个）：** 初始状态 (2) + submit (6) + approve (7) + deny (6) + checkTimeout (7) + getRequest (4) + getPending/getHistory (2) + 综合场景 (3) + 状态不累积 + 空值 + 并发无关
+
+**相比 PLAN 参考代码的改进：**
+- 请求历史：已解析请求不丢弃，保留在 `history` 中供 `getRequest()` 查询和 `getHistory()` 审计
+- `submit` 返回值 `boolean`：调用方可感知重复 ID 冲突并做相应处理
+- 强制状态重置：`submit()` 总是将 status 覆写为 WAITING、刷新 createdAt，防御调用方传脏数据
+- `getRequest(id)` 双向查找：先查 pending 再查 history，WebUI 轮询审批结果时无需额外状态存储
+- 空 ID 防护：`getRequest('')` 直接返回 undefined，防止空字符串误匹配
+
+Commit Hash: `f9314b5`
 
