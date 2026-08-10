@@ -79,7 +79,7 @@ Commit Hash:
 
 - [x] Task 0: 项目脚手架与核心类型
 - [x] Task 1: LLM 抽象层
-- [ ] Task 2: 配置加载器
+- [x] Task 2: 配置加载器
 - [ ] Task 3: 凭据存储
 - [ ] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
 - [ ] Task 5: 5 个内置工具
@@ -117,3 +117,27 @@ Task：Task 1 - LLM 抽象层
 **改进时遇到的 bug：** 重构把 `.map()` 换成了 `for...of` 循环，OpenAI SDK v7 的 `ChatCompletionMessageToolCall` 是 discriminated union，`function` 属性不是所有变体都有，TS 直接报错 `Property 'function' does not exist`。修复：加了一层类型断言先尝试取 `function`，没有就 `continue` 跳过。SDK v4 → v7 的类型变化导致的，不影响运行时。
 
 Commit Hash: `19929b6`
+
+---
+
+### 📋 Task 2 完成
+
+时间：2026-08-10  
+Task：Task 2 - 配置加载器  
+分支：`task/2-config-loader`  
+做了什么：TDD 实现 ConfigLoader，37 个测试覆盖加载/合并/校验/边界/错误路径，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `ConfigLoader.load(filePath?)` — 读取 `.harnessrc.json`，深度合并默认值，校验后返回 `HarnessConfig`
+- 文件不存在 → 使用 `DEFAULTS`（不报错）；JSON 语法错误 → 抛出 `ConfigError`
+- 校验维度：护栏规则结构（tool/pattern/action 必填 + action 合法值）、CheckDef 结构（name/command/signalPattern 必填）、所有正整数字段 > 0、contextThreshold ∈ [0,1]、所有正则字段合法可编译、LLM 字符串字段非空
+- `deepMerge` 语义：对象递归合并、数组替换不拼接、null 值跳过回退默认值
+- 每次 `load()` 通过 `structuredClone` 深拷贝 DEFAULTS，返回独立副本，用户修改不影响后续调用
+
+**遇到的技术问题：**
+- TypeScript 7 + `moduleResolution: "bundler"` 不会自动引入 `@types/node`，`import { readFileSync } from 'fs'` 无法解析。解决方案：文件顶部加 `/// <reference types="node" />` 三斜线指令。后续 task 中用到 Node 内置模块的源文件都需同样处理。
+- `HarnessConfig` 接口缺少索引签名导致无法传给 `Record<string, unknown>` 参数，用 `as unknown as Record<string, unknown>` 类型断言桥接。
+
+**代码 review 后改进：**
+- `deepClone` 从 `JSON.parse(JSON.stringify(obj))` 改为 `structuredClone(obj)`，正确处理 `undefined`、`NaN` 等 JSON 无法序列化的值。一行改动，测试全部保持绿色。
+
