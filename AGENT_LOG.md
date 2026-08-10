@@ -80,7 +80,7 @@ Commit Hash:
 - [x] Task 0: 项目脚手架与核心类型
 - [x] Task 1: LLM 抽象层
 - [x] Task 2: 配置加载器
-- [ ] Task 3: 凭据存储
+- [x] Task 3: 凭据存储
 - [ ] Task 4: 工具系统（接口 + 注册 + 分发 + 黑名单）
 - [ ] Task 5: 5 个内置工具
 - [ ] Task 6: 护栏引擎
@@ -140,4 +140,36 @@ Task：Task 2 - 配置加载器
 
 **代码 review 后改进：**
 - `deepClone` 从 `JSON.parse(JSON.stringify(obj))` 改为 `structuredClone(obj)`，正确处理 `undefined`、`NaN` 等 JSON 无法序列化的值。一行改动，测试全部保持绿色。
+
+Commit Hash: `4de3065`
+
+---
+
+### 📋 Task 3 完成
+
+时间：2026-08-10  
+Task：Task 3 - 凭据存储  
+分支：`task/3-credential-store`  
+做了什么：TDD 实现 CredentialStore —— PBKDF2 (100,000 轮, SHA-512) 密钥派生 + AES-256-GCM 认证加密，19 个测试全部通过，`npx tsc --noEmit` 零错误，无回归。
+
+**实现要点：**
+- `CredentialStore.save(apiKey, masterPassword, filePath?)` — 随机 salt + 随机 IV → PBKDF2 → AES-256-GCM 加密，JSON 落盘
+- `CredentialStore.load(masterPassword, filePath?)` — 读取 → PBKDF2 → AES-256-GCM 解密，authTag 防篡改
+- `CredentialStore.delete(filePath?)` — 幂等删除（文件不存在不抛异常）
+- `CredentialStore.exists(filePath?)` — 同步存在检测
+- `CredentialError` — 自定义错误类型（`name: 'CredentialError'`）
+- 默认路径 `~/.ai4se-harness/credentials.enc`，使用 `path.join()` + `os.homedir()` 三级回退确保跨平台
+
+**测试覆盖（19 个）：** 基本加解密、特殊字符、Unicode、超长 key (10000 字符)、错误密码、空 API key、空主密码、文件不存在、JSON 损坏、字段缺失、Base64 非法、覆盖保存、多次加载一致性、delete 幂等、CredentialError 类型检查。
+
+**实现相比 PLAN 参考代码的改进：**
+- 跨平台路径：`path.dirname()` + `path.join()` 替代 `lastIndexOf('/')` 字符串切割
+- `mkdirSync` 顶部统一 import，而非方法内 `await import('fs')`
+- 字段校验用 `Object.hasOwn()` 替代 truthiness 检查，正确处理空字符串
+
+**代码 review 后改进：**
+- Base64 校验原为 try/catch，但 Node.js 的 `Buffer.from(str, 'base64')` 遇到非法字符静默跳过不抛异常，catch 分支为死代码。改为正则 `/^[A-Za-z0-9+/]*={0,2}$/` 预检，确保非法 Base64 精确报出而非被解密步骤兜底为"密码错误"。
+- `async` 标记内部全同步调用（`pbkdf2Sync`/`randomBytes`/`writeFileSync` 等）——PLAN 接口约定 `Promise<void>`，保持现状；未来性能敏感时可切换异步版 crypto。
+
+Commit Hash: `e545490`
 
