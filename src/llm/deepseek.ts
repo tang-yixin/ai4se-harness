@@ -39,7 +39,7 @@ export class DeepSeekProvider implements LLMProvider {
     try {
       response = await this.client.chat.completions.create({
         model: this.model,
-        messages: messages as OpenAI.Chat.ChatCompletionMessageParam[],
+        messages: toOpenAIMessages(messages),
         tools: tools.length > 0
           ? tools.map(t => ({
               type: 'function' as const,
@@ -53,7 +53,9 @@ export class DeepSeekProvider implements LLMProvider {
         max_tokens: this.maxTokens,
       });
     } catch (error) {
-      // 网络/限流/服务端错误 → 由上层重试逻辑处理（指数退避）
+      // 网络/限流/服务端错误 → 打印诊断信息后返回 error 状态
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[DeepSeek] API call failed: ${message}`);
       return {
         content: null,
         toolCalls: [],
@@ -113,4 +115,42 @@ export class DeepSeekProvider implements LLMProvider {
       },
     };
   }
+}
+
+// ================================================================
+// 内部辅助：Message 格式转换
+// ================================================================
+
+/**
+ * 将内部 Message（camelCase）转换为 OpenAI SDK 期望的格式（snake_case）。
+ *
+ * 关键转换：
+ * - toolCallId → tool_call_id（否则 DeepSeek API 返回 400 缺失字段错误）
+ * - 保留 name 字段（用于区分同名函数调用）
+ */
+function toOpenAIMessages(messages: Message[]): OpenAI.Chat.ChatCompletionMessageParam[] {
+  return messages.map((msg) => {
+    const result: Record<string, unknown> = {
+      role: msg.role,
+      content: msg.content,
+    };
+    if (msg.toolCallId) {
+      result.tool_call_id = msg.toolCallId;
+    }
+    if (msg.name) {
+      result.name = msg.name;
+    }
+    // assistant 消息需要携带原始的 tool_calls 结构（API 要求）
+    if (msg.toolCalls && msg.toolCalls.length > 0) {
+      result.tool_calls = msg.toolCalls.map((tc) => ({
+        id: tc.id,
+        type: 'function',
+        function: {
+          name: tc.name,
+          arguments: JSON.stringify(tc.arguments),
+        },
+      }));
+    }
+    return result as unknown as OpenAI.Chat.ChatCompletionMessageParam;
+  });
 }

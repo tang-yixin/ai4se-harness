@@ -516,12 +516,10 @@ Instructions:
    */
   private buildAssistantMessage(response: LLMResponse): Message {
     if (response.toolCalls.length > 0) {
-      const toolCallDescs = response.toolCalls.map(
-        (tc) => `${tc.name}(${JSON.stringify(tc.arguments)})`,
-      );
       return {
         role: 'assistant',
-        content: `[Tool calls: ${toolCallDescs.join(', ')}]`,
+        content: response.content ?? '',
+        toolCalls: response.toolCalls,
       };
     }
 

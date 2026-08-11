@@ -90,7 +90,7 @@ Commit Hash:
 - [x] Task 10: 决策指纹匹配器
 - [x] Task 11: 反馈闭环
 - [x] Task 12: Agent 主循环
-- [ ] Task 13: CLI 入口
+- [x] Task 13: CLI 入口
 - [ ] Task 14: WebUI
 - [ ] Task 15: 集成测试 + Docker + README
 
@@ -460,4 +460,67 @@ Task：Task 12 - Agent 主循环
 - ✅ 工具执行关键信息写入对话历史（agent 知道上一步做了什么）
 
 Commit Hash: `5a8888f`
+
+---
+
+### 📋 Task 13 完成
+
+时间：2026-08-11  
+Task：Task 13 - CLI 入口  
+分支：`task/13-cli-entry`  
+做了什么：TDD 实现 CLI 入口（commander.js），提供 5 个子命令，9 个结构测试 + 全量 432 测试通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `createProgram()` — 导出函数模式，测试可 import 检查程序结构而不触发 `program.parse()`
+- `isEntryPoint()` — 通过 `process.argv[1]` + `fileURLToPath(import.meta.url)` 精确检测入口点，支持 tsx / 编译后 dist / 跨平台路径
+- 5 个子命令：`harness run <task>` / `harness setup` / `harness key status` / `harness key update` / `harness key delete`
+- `promptMasked()` — 在 TTY 环境启用 stdin raw mode，回显 `*`；非 TTY fallback 到 readline
+- `promptLine()` — 普通 readline 输入（HITL 审批提示）
+- `resolveApiKey()` — 优先 `DEEPSEEK_API_KEY` 环境变量 → 交互式密码解密（最多 3 次重试）
+- `buildDefaultConfigTemplate()` — setup 时自动写入 `.harnessrc.json` 默认配置模板（对齐 SPEC §3.6）
+
+**测试覆盖（9 个）：** 程序名/描述/命令注册/参数强制/选项存在/多次创建独立性/名称一致性/setup 无必需参数
+
+**代码 review 后改进：**
+1. `harness setup` 原仅打印提示不生成文件 → 新增 `buildDefaultConfigTemplate()` 写入完整 `.harnessrc.json`
+
+Commit Hash: `5a7dd6a`
+
+---
+
+### 🔀 跨 Task 工作：交互式 HITL 审批集成（Task 7 + 12 + 13）
+
+时间：2026-08-11  
+涉及分支：`task/13-cli-entry`（同一分支内完成的额外改进）  
+审核问题：SPEC §3.3 要求 CLI 交互模式弹出 `⚠️ 危险操作: [详情] (A)pprove / (D)eny?`，但当前 CLI 未注册 HITL 回调——所有 confirm 操作被 auto-deny。
+
+**改动范围（3 个文件，跨 3 个 Task 的模块）：**
+
+| 文件 | 所属 Task | 改动 |
+|------|----------|------|
+| `src/guardrails/hitl.ts` | Task 7 | 新增 `waitForResolution(id, timeoutSeconds)` —— 100ms 间隔轮询等待请求解析（外部 approve/deny 或超时） |
+| `src/core/agent-loop.ts` | Task 12 | `handleHITL()` 重构：从「submit → 立刻 auto-deny」改为「submit → await waitForResolution → 根据状态执行/拒绝」 |
+| `src/cli/index.ts` | Task 13 | `harness run` 注册 `loop.hitl.onRequest` 回调，弹出终端审批提示；新增 `promptLine()` 辅助函数 |
+
+**数据流变化：**
+```
+改前：submit → checkTimeout → getRequest → WAITING → auto-deny（用户永远无法审批）
+改后：submit → onRequest 回调 → CLI 弹出 ⚠️ 提示 → waitForResolution → APPROVED/DENIED/TIMEOUT
+```
+
+**新增测试：** `tests/unit/hitl.test.ts` +6 个 `waitForResolution()` 测试（外部 approve/deny/timeout/未知 ID/onResolved 回调/同步预先 approve），全量 438 测试零回归。
+
+Commit Hash: `61f393c`
+
+---
+
+### 🔧 跨 Task 修复：非 TTY 环境 HITL 阻塞（Task 12）
+
+时间：2026-08-12  
+审核问题：在 CI/Docker/管道等非 TTY 环境，无 `onRequest` 回调 → `waitForResolution` 轮询等待完整 `timeoutSeconds`（默认 60s）才超时。3 个 confirm 操作 = 额外 3 分钟阻塞。
+
+**修复：** `handleHITL()` 中 `submit` 后检查 `!this.hitl.onRequest` → 无人值守模式直接 `deny`（< 1ms），不调用 `waitForResolution`。仅 4 行逻辑，全量 438 测试零回归。
+
+Commit Hash: `53576ac`
+
 
