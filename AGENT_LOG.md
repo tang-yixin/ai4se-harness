@@ -86,7 +86,7 @@ Commit Hash:
 - [x] Task 6: 护栏引擎
 - [x] Task 7: HITL 状态机
 - [x] Task 8: 范围围栏
-- [ ] Task 9: 记忆管理
+- [x] Task 9: 记忆管理
 - [ ] Task 10: 决策指纹匹配器
 - [ ] Task 11: 反馈闭环
 - [ ] Task 12: Agent 主循环
@@ -315,4 +315,37 @@ Task：Task 8 - 范围围栏（Scope Fence）
 2. 符号链接穿越：审计指出 `path.resolve()` 不追踪符号链接，判断为接受——GuardrailEngine（第二层）的系统目录检测可兜底
 
 Commit Hash: `1dd42c9`
+
+---
+
+### 📋 Task 9 完成
+
+时间：2026-08-10  
+Task：Task 9 - 记忆管理  
+分支：`task/9-memory-store`  
+做了什么：TDD 实现 MemoryStore —— 三类记忆（项目记忆 / 决策记忆 / 会话记忆）的存储与检索，含 maxTokens 截断摘要生成和精确指纹匹配。37 个新测试 + 295 个存量测试共 332 全部通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- 项目记忆 (`set`/`get`/`delete`/`clear`/`all`) — 基于 Map 的 key-value 存储，支持按 category 过滤
+- `summarize()` — 按 updatedAt 降序排列，1 token ≈ 4 字符粗略估算，maxTokens 截断。maxTokens=0 时返回空字符串
+- `recordDecision(record)` — 决策记录追加到数组，保留完整 DecisionRecord 字段
+- `findDecision(toolName, fingerprint)` — 倒序精确匹配（工具名 + 命令指纹完全相同），返回最近匹配的副本
+- `getAllDecisions()` — 返回决策数组的深拷贝，防止外部修改内部状态
+- `shouldSummarize(round, tokenEstimate, contextWindowTokens?)` — 双轨触发判断（轮数 + token 阈值），接受外部 LLM 上下文窗口大小参数
+
+**测试覆盖（37 个）：** PLAN 4 个基础测试 + 覆盖与删除 (4) + 摘要截断 (5) + 决策记录管理 (6) + 边界条件（空 key/value/超长值/大量条目/状态累积/返回副本）(14) + 配置参数与 shouldSummarize (8)
+
+**相比 PLAN 参考代码的改进：**
+- `all()` 返回新数组副本而非内部引用，防止外部意外修改
+- `clear()` 同时清空 entries 和 decisions，PLAN 未定义此方法
+- `delete(key)` 返回 boolean 指示是否成功删除
+- `summarize()` 新增 `maxChars <= 0` 提前返回，避免零值输出非空摘要
+- `findDecision()` 倒序查找 + 返回副本，调用方拿到独立数据
+- `shouldSummarize()` 新增 `contextWindowTokens` 可选参数，解决 `memory.maxTokens` 被混用作 LLM 上下文窗口大小的问题
+
+**代码 review 后改进：**
+1. `shouldSummarize` 混用 `memory.maxTokens` 为上下文窗口大小 → 新增可选参数 `contextWindowTokens`，由调用方（AgentLoop）从 `llm.maxTokens` 传入，未传时回退到 `memory.maxTokens` 保持向后兼容
+2. `recordDecision` 无重复检测 → reviewer 确认为设计提醒，不改（同一操作多次审批各自独立记录）
+
+Commit Hash: `3e47f8b`
 
