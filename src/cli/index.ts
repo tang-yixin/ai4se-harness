@@ -97,6 +97,30 @@ export function createProgram(): Command {
 
         // 运行 Agent 主循环
         const loop = new AgentLoop({ llm, tools, config, memory });
+
+        // 注册交互式 HITL 审批回调 —— 当护栏引擎标记 confirm 时弹出终端提示
+        if (stdin.isTTY) {
+          loop.hitl.onRequest = async (req) => {
+            // 预留一行空行让输出更可读
+            console.log(
+              `\n⚠️  Dangerous operation detected:\n`
+              + `   Tool   : ${req.toolName}\n`
+              + `   Reason : ${req.reason}\n`
+              + `   Params : ${JSON.stringify(req.params)}`,
+            );
+
+            const answer = await promptLine('   (A)pprove / (D)eny? ');
+
+            if (answer.toLowerCase() === 'a' || answer.toLowerCase() === 'approve') {
+              loop.hitl.approve(req.id);
+              console.log('   → Approved\n');
+            } else {
+              loop.hitl.deny(req.id);
+              console.log('   → Denied\n');
+            }
+          };
+        }
+
         console.log(`Starting agent for task: "${task}"\n`);
 
         const result = await loop.run(task);
@@ -350,6 +374,22 @@ async function resolveApiKey(): Promise<string | null> {
   }
 
   return null;
+}
+
+/**
+ * 普通文本输入提示（不回显掩码，用于 HITL 审批等非敏感输入）。
+ *
+ * @param promptText 提示文本（如 "(A)pprove / (D)eny? "）
+ * @returns 用户输入字符串（去除首尾空白）
+ */
+function promptLine(promptText: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: stdin, output: stdout });
+    rl.question(promptText, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
 }
 
 /**

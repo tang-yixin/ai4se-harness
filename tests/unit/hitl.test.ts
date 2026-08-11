@@ -393,6 +393,70 @@ describe('HITLStateMachine', () => {
   });
 
   // ----------------------------------------------------------
+  // waitForResolution（异步等待审批）
+  // ----------------------------------------------------------
+
+  describe('waitForResolution()', () => {
+    it('resolves to APPROVED when externally approved', async () => {
+      hitl.submit(makeRequest({ id: '1', timeoutSeconds: 60 }));
+
+      // 模拟外部审批：在 50ms 后 approve
+      setTimeout(() => hitl.approve('1'), 50);
+
+      const status = await hitl.waitForResolution('1', 60);
+      expect(status).toBe('APPROVED');
+    });
+
+    it('resolves to DENIED when externally denied', async () => {
+      hitl.submit(makeRequest({ id: '1', timeoutSeconds: 60 }));
+
+      // 模拟外部拒绝
+      setTimeout(() => hitl.deny('1'), 50);
+
+      const status = await hitl.waitForResolution('1', 60);
+      expect(status).toBe('DENIED');
+    });
+
+    it('resolves to TIMEOUT when deadline expires', async () => {
+      // 使用短超时确保快速测试
+      hitl.submit(makeRequest({ id: '1', timeoutSeconds: 0 }));
+
+      const status = await hitl.waitForResolution('1', 0);
+      expect(status).toBe('TIMEOUT');
+      // 超时后请求应从 pending 移除
+      expect(hitl.getPending()).toHaveLength(0);
+    });
+
+    it('resolves to TIMEOUT for unknown request id', async () => {
+      const status = await hitl.waitForResolution('nonexistent', 1);
+      expect(status).toBe('TIMEOUT');
+    });
+
+    it('fires onResolved callback on timeout', async () => {
+      const callback = vi.fn();
+      hitl.onResolved = callback;
+
+      hitl.submit(makeRequest({ id: '1', timeoutSeconds: 0 }));
+
+      await hitl.waitForResolution('1', 0);
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledWith(
+        expect.objectContaining({ id: '1', status: 'TIMEOUT' }),
+      );
+    });
+
+    it('sync approve before waitForResolution still works', async () => {
+      hitl.submit(makeRequest({ id: '1', timeoutSeconds: 60 }));
+      // 在调用 waitForResolution 之前同步批准
+      hitl.approve('1');
+
+      const status = await hitl.waitForResolution('1', 60);
+      expect(status).toBe('APPROVED');
+    });
+  });
+
+  // ----------------------------------------------------------
   // 综合场景
   // ----------------------------------------------------------
 

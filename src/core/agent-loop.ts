@@ -285,7 +285,13 @@ export class AgentLoop {
 
   /**
    * 处理 HITL 审批流程。
-   * 在自动化模式下，submit 后立即 checkTimeout；若超时则自动拒绝。
+   *
+   * 通过 waitForResolution 阻塞等待审批结果：
+   *   - CLI 交互模式：onRequest 回调弹出提示 → 用户选择 → approve/deny
+   *   - 自动化模式（无回调）：超时自动拒绝
+   *   - 已批准的历史决策（精确匹配）：在调用此方法前已跳过 HITL
+   *
+   * @returns APPROVED 时执行工具并返回反馈；DENIED/TIMEOUT 时返回拒绝反馈
    */
   private async handleHITL(
     toolCall: ToolCall,
@@ -306,76 +312,49 @@ export class AgentLoop {
       timeoutSeconds,
     };
 
-    // 提交到 HITL
+    // 提交到 HITL 状态机（触发 onRequest 回调，CLI 可在此弹出审批提示）
     this.hitl.submit(hitlReq);
 
-    // 检查是否立即超时（自动化模式：短超时设置用于测试）
-    this.hitl.checkTimeout();
+    // 阻塞等待审批结果（外部 approve/deny 或超时）
+    const status = await this.hitl.waitForResolution(hitlReq.id, timeoutSeconds);
 
-    // 查询请求状态
-    const resolved = this.hitl.getRequest(hitlReq.id);
-
-    if (resolved && resolved.status === 'TIMEOUT') {
-      // 超时自动拒绝
-      const timeoutFeedback: Feedback = {
-        success: false,
-        failureType: 'GUARDRAIL_DENY',
-        suggestion: 'The HITL request timed out. Try a lower-risk approach.',
-        summary: `✗ ${toolCall.name} HITL timeout: ${reason}`,
-        rawOutput: `HITL request ${hitlReq.id} timed out.`,
-      };
-
-      messages.push({
-        role: 'tool',
-        content: `HITL request ${hitlReq.id} timed out: ${reason}`,
-        toolCallId: toolCall.id,
-      });
-
-      this.memory.recordDecision({
-        toolName: toolCall.name,
-        commandFingerprint: fingerprint,
-        action: 'denied',
-        timestamp: Date.now(),
-      });
-
-      return timeoutFeedback;
-    }
-
-    // 仍在等待中（自动化模式默认拒绝）
-    if (resolved && resolved.status === 'WAITING') {
-      this.hitl.deny(hitlReq.id);
-
-      const denyFeedback: Feedback = {
-        success: false,
-        failureType: 'GUARDRAIL_DENY',
-        suggestion: 'Consider an alternative approach that does not require HITL approval.',
-        summary: `✗ ${toolCall.name} HITL denied (automated mode): ${reason}`,
-        rawOutput: `HITL request ${hitlReq.id} auto-denied in automated mode.`,
-      };
-
-      messages.push({
-        role: 'tool',
-        content: `HITL request ${hitlReq.id} auto-denied (automated mode): ${reason}`,
-        toolCallId: toolCall.id,
-      });
-
-      this.memory.recordDecision({
-        toolName: toolCall.name,
-        commandFingerprint: fingerprint,
-        action: 'denied',
-        timestamp: Date.now(),
-      });
-
-      return denyFeedback;
-    }
-
-    // HITL 已批准（由外部 approve 调用触发，如 CLI 交互模式）
-    if (resolved && resolved.status === 'APPROVED') {
+    // ---- 已批准 → 执行工具 ----
+    if (status === 'APPROVED') {
       return await this.executeTool(toolCall, messages);
     }
 
-    // 兜底：请求不在 pending 也不在 history
-    return null;
+    // ---- 拒绝或超时 → 生成拒绝反馈 ----
+    const isTimeout = status === 'TIMEOUT';
+    const summary = isTimeout
+      ? `✗ ${toolCall.name} HITL timeout: ${reason}`
+      : `✗ ${toolCall.name} HITL denied (automated mode): ${reason}`;
+
+    const suggestion = isTimeout
+      ? 'The HITL request timed out. Try a lower-risk approach.'
+      : 'Consider an alternative approach that does not require HITL approval.';
+
+    const denyFeedback: Feedback = {
+      success: false,
+      failureType: 'GUARDRAIL_DENY',
+      suggestion,
+      summary,
+      rawOutput: `HITL request ${hitlReq.id} ${status === 'TIMEOUT' ? 'timed out' : 'denied'}.`,
+    };
+
+    messages.push({
+      role: 'tool',
+      content: summary,
+      toolCallId: toolCall.id,
+    });
+
+    this.memory.recordDecision({
+      toolName: toolCall.name,
+      commandFingerprint: fingerprint,
+      action: 'denied',
+      timestamp: Date.now(),
+    });
+
+    return denyFeedback;
   }
 
   /**
