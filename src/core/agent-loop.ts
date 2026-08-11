@@ -286,9 +286,11 @@ export class AgentLoop {
   /**
    * 处理 HITL 审批流程。
    *
-   * 通过 waitForResolution 阻塞等待审批结果：
-   *   - CLI 交互模式：onRequest 回调弹出提示 → 用户选择 → approve/deny
-   *   - 自动化模式（无回调）：超时自动拒绝
+   * 双模式：
+   *   - 无人值守（无 onRequest 回调）：立即拒绝，不阻塞等待超时
+   *     （避免 CI/Docker/管道环境下每个 confirm 操作阻塞 60 秒）
+   *   - 交互模式（有 onRequest 回调）：通过 waitForResolution 阻塞等待
+   *     用户审批或超时
    *   - 已批准的历史决策（精确匹配）：在调用此方法前已跳过 HITL
    *
    * @returns APPROVED 时执行工具并返回反馈；DENIED/TIMEOUT 时返回拒绝反馈
@@ -315,8 +317,16 @@ export class AgentLoop {
     // 提交到 HITL 状态机（触发 onRequest 回调，CLI 可在此弹出审批提示）
     this.hitl.submit(hitlReq);
 
-    // 阻塞等待审批结果（外部 approve/deny 或超时）
-    const status = await this.hitl.waitForResolution(hitlReq.id, timeoutSeconds);
+    let status: 'APPROVED' | 'DENIED' | 'TIMEOUT';
+
+    if (!this.hitl.onRequest) {
+      // ---- 无人值守模式：无回调注册 → 立即拒绝，不阻塞等待 ----
+      this.hitl.deny(hitlReq.id);
+      status = 'DENIED';
+    } else {
+      // ---- 交互模式：阻塞等待审批或超时 ----
+      status = await this.hitl.waitForResolution(hitlReq.id, timeoutSeconds);
+    }
 
     // ---- 已批准 → 执行工具 ----
     if (status === 'APPROVED') {
