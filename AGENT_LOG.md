@@ -87,7 +87,7 @@ Commit Hash:
 - [x] Task 7: HITL 状态机
 - [x] Task 8: 范围围栏
 - [x] Task 9: 记忆管理
-- [ ] Task 10: 决策指纹匹配器
+- [x] Task 10: 决策指纹匹配器
 - [ ] Task 11: 反馈闭环
 - [ ] Task 12: Agent 主循环
 - [ ] Task 13: CLI 入口
@@ -348,4 +348,28 @@ Task：Task 9 - 记忆管理
 2. `recordDecision` 无重复检测 → reviewer 确认为设计提醒，不改（同一操作多次审批各自独立记录）
 
 Commit Hash: `3e47f8b`
+
+---
+
+### 📋 Task 10 完成
+
+时间：2026-08-11  
+Task：Task 10 - 决策指纹匹配器  
+分支：`task/10-decision-fingerprint`  
+做了什么：TDD 实现 DecisionFingerprint —— 两级决策指纹匹配（精确匹配 + 模糊匹配），22 个新测试 + 332 个存量测试共 354 全部通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `DecisionFingerprint.match(store, toolName, commandFingerprint)` → `MatchResult { matched, level: 'exact'|'fuzzy'|'none', previousAction? }`
+- **精确匹配** — 委托 `MemoryStore.findDecision()`（工具名 + 指纹完全相同），倒序优先返回最近决策
+- **模糊匹配** — 遍历同工具名的所有历史决策，取最高相似度，≥ 阈值 0.6 返回 `level='fuzzy'`
+- `calculateSimilarity(a, b)` — Dice 系数（基于字符 bigram），public static 可独立调用验证
+- `toBigramSet(s)` — 将字符串拆分为连续两字符集合，含 `MAX_BIGRAM_INPUT_LENGTH = 10_000` 防御性截断
+
+**测试覆盖（22 个）：** 精确匹配 (3) + 模糊匹配 (4) + 无匹配 (3) + 空输入/极端值 (5) + 状态累积 (1) + 相似度算法正确性 (5) + 超长字符串截断 (1)
+
+**相比 PLAN 参考代码的设计变更：**
+1. **相似度算法从 LCP 改为 Dice 系数** — PLAN 指定最长公共前缀，但 LCP 对中缀/后缀变异不敏感（如 `echo hello` vs `printf "hello"` 前缀不同 LCP≈0）。Dice 系数基于 bigram 交集，对所有位置的变异均有均匀区分度，是信息检索领域的标准度量。阈值 0.6 经手工验证合理。
+2. **新增 `MAX_BIGRAM_INPUT_LENGTH` 截断** — 代码 review 指出超长字符串（如文件内容被误传为命令）会产生 ~N 个 bigram 对象，有理论内存压力。加 10,000 字符上限，对实际 shell 命令（极少超 1KB）零影响。
+
+Commit Hash: `8f0198e`
 
