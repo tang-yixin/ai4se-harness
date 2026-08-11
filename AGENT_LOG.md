@@ -88,7 +88,7 @@ Commit Hash:
 - [x] Task 8: 范围围栏
 - [x] Task 9: 记忆管理
 - [x] Task 10: 决策指纹匹配器
-- [ ] Task 11: 反馈闭环
+- [x] Task 11: 反馈闭环
 - [ ] Task 12: Agent 主循环
 - [ ] Task 13: CLI 入口
 - [ ] Task 14: WebUI
@@ -372,4 +372,39 @@ Task：Task 10 - 决策指纹匹配器
 2. **新增 `MAX_BIGRAM_INPUT_LENGTH` 截断** — 代码 review 指出超长字符串（如文件内容被误传为命令）会产生 ~N 个 bigram 对象，有理论内存压力。加 10,000 字符上限，对实际 shell 命令（极少超 1KB）零影响。
 
 Commit Hash: `8f0198e`
+
+---
+
+### 📋 Task 11 完成
+
+时间：2026-08-11  
+Task：Task 11 - 反馈闭环  
+分支：`task/11-feedback-pipeline`  
+做了什么：TDD 实现 SignalExtractor（⑥a）+ FailureClassifier（⑥b）+ FeedbackFormatter（⑥c），40 个新测试 + 354 个存量测试共 394 全部通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `SignalExtractor.extract(result, signalPatterns?)` — 两级判定：exitCode !== 0（操作系统级信号）+ 内在失败签名（`error TS\d+`、独立单词 `\bFAIL\b`）。不盲用 CheckDef 的 signalPattern（"passing" 是成功标记会假阳性）
+- `FailureClassifier.classify(exitCode, stdout, stderr, signalPatterns?)` — 六类优先级分类：GUARDRAIL_DENY > TYPE_ERROR > TEST_FAILURE > LINT_ERROR > SHELL_ERROR > UNKNOWN_FAILURE。返回 null 表示成功
+- `FeedbackFormatter.format(result, failureType)` — ✓/✗ 符号格式化 + 截断（500 字符，按 Unicode 码点防中文乱码）+ 每种 FailureType 配修复建议文案
+
+**测试覆盖（40 个）：** SignalExtractor (10) / FailureClassifier (19) / FeedbackFormatter (11)。含超长输出 (100K+)、空输入、空白字符、大小写不敏感、优先级冲突、多次调用独立性、格式符号验证。
+
+**相比 PLAN 参考代码的设计变更：**
+1. **SignalExtractor 不盲匹 signalPatterns** — PLAN 遍历所有 CheckDef.signalPattern 做失败检测，但 `"FAIL|passing"` 中的 `"passing"` 会误判成功输出。改用内置失败签名，仅当 exitCode !== 0 或匹配 `error TS\d+`/`\bFAIL\b` 时判定失败
+2. **LINT_ERROR 精确匹配** — PLAN 用 `error\b|warning\b` 太宽，"unrecognizable error output" 中的 "error" 会被误分类。改为 `error:|warning:` 带冒号的 lint 标准输出格式
+3. **SHELL_ERROR vs UNKNOWN_FAILURE 区分** — SHELL_ERROR 匹配可识别 shell 错误（`/bin/sh:`、`command not found`），UNKNOWN_FAILURE 兜底非零 exitCode 且不可识别的情况
+4. **相似度算法** — Dice 系数替代 PLAN 的 LCP（已在 Task 10 中决策，此处沿用设计一致性）
+5. **truncateSummary 按码点截断** — `Array.from().slice()` 替代 `.slice()`，防止多字节字符（中文/emoji）被切成乱码
+
+**实现中遇到的 bug：**
+- SignalExtractor 假阳性（"passing" 匹配）→ 改用内置失败签名
+- LINT_ERROR 过宽（描述性 "error" 单词）→ 改用 `error:` 精确格式
+- SHELL_ERROR/UNKNOWN_FAILURE 边界模糊 → 引入可识别 shell 格式判定
+- rawOutput 空字段产生多余 `\n` → 条件拼接
+
+**代码 review 后改进：**
+1. `_signalPatterns` 参数 JSDoc 标注预留用途（未来支持用户自定义分类关键词，如 pytest 的 "FAILED"）
+2. `truncateSummary` 从 UTF-16 `.slice()` 改为 `Array.from().slice().join()`，正确处理 Unicode 代理对
+
+Commit Hash: `7c953a2`
 
