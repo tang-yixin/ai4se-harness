@@ -89,7 +89,7 @@ Commit Hash:
 - [x] Task 9: 记忆管理
 - [x] Task 10: 决策指纹匹配器
 - [x] Task 11: 反馈闭环
-- [ ] Task 12: Agent 主循环
+- [x] Task 12: Agent 主循环
 - [ ] Task 13: CLI 入口
 - [ ] Task 14: WebUI
 - [ ] Task 15: 集成测试 + Docker + README
@@ -407,4 +407,57 @@ Task：Task 11 - 反馈闭环
 2. `truncateSummary` 从 UTF-16 `.slice()` 改为 `Array.from().slice().join()`，正确处理 Unicode 代理对
 
 Commit Hash: `7c953a2`
+
+---
+
+### 📋 Task 12 完成
+
+时间：2026-08-11  
+Task：Task 12 - Agent 主循环  
+分支：`task/12-agent-loop`  
+
+**做了什么：** 实现 AgentLoop —— harness 核心引擎，用 while 循环（非递归）拼装全部 10 个子系统，驱动「上下文组装 → LLM 调用 → 解析 → 护栏 → HITL → 范围围栏 → 工具执行 → 反馈 → 停机判断」完整闭环。初始 15 个测试 → 经两轮 review 改进至 **29 个测试**，全量 423 测试零回归，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- **主循环**：while 循环 + 显式 break 条件（非递归），严格遵守 SPEC §3.1 流程图
+- **集成 10 个模块**：LLMProvider / ToolRegistry / ToolDispatcher / GuardrailEngine / HITLStateMachine / ScopeFenceGuard / DecisionFingerprint / SignalExtractor / FailureClassifier / FeedbackFormatter
+- **三层纵深防御完整串联**：GuardrailEngine（第二层）→ 决策指纹匹配（精确跳过/模糊降级/无匹配进 HITL）→ ScopeFenceGuard（第三层：路径边界 + 主机白名单）→ ToolDispatcher（第一层：硬黑名单时抛 GuardrailViolation）
+- **HITL 非阻塞**：submit → checkTimeout → 自动化模式默认拒绝；公开 `readonly hitl` 供 CLI/WebUI 外部审批
+- **反馈合并**：每轮只加一条 `[FEEDBACK]` system 消息，避免消息数组爆炸
+- **自动 checks 容错**：命令不可用时检测多种平台模式（bash "command not found" + 退出码 127 + Windows "not recognized"）→ 跳过并记 `[info]` 日志
+- **对话历史正确性**：tool_calls 响应 push assistant 消息 + 每个工具结果 push `role='tool'` 消息
+
+**测试覆盖（29 个，初始 15 + review 后 14）：**
+- 基础：3 轮循环 / maxRounds 超限 / LLM 错误 / 空任务 / 单轮完成 / 连续运行状态隔离
+- 护栏：deny 拦截 + 决策记录 / 多 tool_call 混合 deny+pass
+- HITL：timeout 自动拒绝 / 外部 approve 通过 / 模糊匹配进 HITL
+- 范围围栏：工作区外路径拒绝 / 工作区内路径放行 / curl 非白名单主机进 HITL
+- 反馈：未知工具错误 / 反馈注入下一轮 / 精确内容断言
+- Checks：工具不可用跳过 / 空配置快速路径 / 多平台错误检测
+- 边界：tool_calls 空数组 / content=null / 非 shell 工具指纹 / 记忆摘要注入 system prompt
+
+**代码 review 改进（两轮）：**
+
+第一轮 review —— **P0-P2 全面修复**：
+1. **P0-1**：新增模糊匹配 → HITL 流程测试
+2. **P0-2**：`hitl` 从 private 改为 `readonly` public，新增外部 approve 路径测试（通过 `onRequest` 回调模拟）
+3. **P0-3**：分析确认 GuardrailViolation catch 块**非死代码**——`ToolDispatcher.dispatch()` 是 `throw` 不是 `return`，`shutdown` 命令通过 GuardrailEngine 但被 Blacklist 拦截，catch 块可达。新增测试覆盖该链路。
+4. **P1-4/5**：**ScopeFenceGuard 集成到 processToolCall**（之前构造了但从未调用）——write_file 执行前 `validatePath()`，execute_shell 含 curl/wget 时 `validateHost()`
+5. **P1-6/7**：新增 runAutoChecks 跳过测试、混合 deny+pass 多 tool_call 测试
+6. **P2-8~10**：空 checks 快速路径、精确反馈内容断言、记忆摘要注入验证
+7. 新增 `extractCurlWgetUrl()` 辅助方法，移除未使用的 `round` 参数和 `FailureType` import
+
+第二轮 review —— **副作用消除**：
+1. **Point 1（误判）**：审核认为 GuardrailViolation catch 是死代码，经验证 `ToolDispatcher.dispatch()` L51-55 明确 `throw new GuardrailViolation()`，`shutdown -h now` 经 GuardrailEngine(无 action) → executeTool → Dispatcher throw → catch 捕获，完整链路可达
+2. **Point 2（正确）**：`ConfigLoader.DEFAULTS` 含 3 条 checks（`npx tsc --noEmit` / `npx eslint` / `npm test`），每个非 checks 测试都在后台执行这些真实命令。新增 `noChecksConfig`（空 checks 数组）替换所有非 checks 测试引用
+
+**关键设计决策与常见陷阱规避：**
+- ✅ while 循环非递归（防止栈溢出）
+- ✅ HITL 非阻塞（submit → checkTimeout → auto-deny，不同步等待）
+- ✅ tool_calls assistant 消息 + role='tool' 结果全部 push（LLM 能感知自己调了什么）
+- ✅ checks 不可用时跳过而非报 FAIL
+- ✅ 每轮一条 [FEEDBACK]（防止消息爆炸）
+- ✅ 工具执行关键信息写入对话历史（agent 知道上一步做了什么）
+
+Commit Hash: `5a8888f`
 
