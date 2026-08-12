@@ -142,6 +142,62 @@ export class ScopeFenceGuard {
   }
 
   // ============================================================
+  // 公共方法 — shell 命令输出路径校验
+  // ============================================================
+
+  /**
+   * 从 shell 命令中提取输出目标路径，并用 validatePath() 逐一校验。
+   *
+   * 目的：防止 agent 通过 shell 重定向（> / >> / tee / dd of=）将内容
+   * 写入工作区外，从而绕过 write_file 的路径边界检查。
+   *
+   * 覆盖的重定向模式：
+   * - 标准输出重定向：>、>>、1>、2>、&>、1>>、2>>、&>>
+   * - tee 命令（含 -a 追加模式）
+   * - dd 命令的 of= 参数
+   *
+   * 已知局限（在 JSDoc 中显式标注）：
+   * - **cd 绕过**：`cd .. && echo hello > test.txt` 无法静态检测——cd 改变
+   *   的是 shell 进程的 CWD，字符串层面无法判定 test.txt 最终落点。
+   *   这是 shell 灵活性的固有限制，不尝试修复。
+   * - **引号、eval、heredoc、动态变量展开**：正则解析不处理 shell 语法，
+   *   复杂构造无法覆盖。
+   * - **误拦截风险**：极少数情况下，命令字符串中含 `>` 字符（如 echo ">"）
+   *   可能触发假阳性提取。提取到的"路径"经 validatePath() 判定在工作区内
+   *   时会放行，仍有可能越界的假路径被误拦，但比漏拦更安全。
+   *
+   * 策略：提取不到路径 → 放行（保守，不过度拦截）。
+   *       任一提取路径越界 → 拒绝。
+   *
+   * @param command shell 命令字符串
+   * @returns 校验结果
+   */
+  validateShellCommand(command: string): FenceResult {
+    // 空/空白命令 → 放行
+    if (!command || command.trim().length === 0) {
+      return { allowed: true };
+    }
+
+    // 提取所有输出目标路径
+    const paths = this.extractShellOutputPaths(command);
+
+    // 无提取路径 → 放行（保守策略：不理解的不拦截）
+    if (paths.length === 0) {
+      return { allowed: true };
+    }
+
+    // 逐个校验：任一越界则拒绝
+    for (const path of paths) {
+      const result = this.validatePath(path);
+      if (!result.allowed) {
+        return result;
+      }
+    }
+
+    return { allowed: true };
+  }
+
+  // ============================================================
   // 属性访问器
   // ============================================================
 
@@ -163,6 +219,53 @@ export class ScopeFenceGuard {
   // ============================================================
   // 私有方法
   // ============================================================
+
+  /**
+   * 从 shell 命令字符串中提取所有输出目标路径。
+   *
+   * 支持三种输出模式：
+   * 1. 重定向操作符：>  >>  1>  2>  &>  1>>  2>>  &>>
+   * 2. tee 命令（含 -a 等标志位）
+   * 3. dd 命令的 of= 参数
+   *
+   * @param command shell 命令字符串
+   * @returns 提取到的路径数组（可能为空）
+   */
+  private extractShellOutputPaths(command: string): string[] {
+    const paths: string[] = [];
+
+    // 模式 1: 重定向 — [N][&]>>? path
+    // 匹配: 可选数字前缀 + 可选 & + 一个或多个 > + 可选空格 + 路径token
+    const redirectRe = /[0-9]*&?>+\s*([^\s|;&<>]+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = redirectRe.exec(command)) !== null) {
+      const path = match[1];
+      if (path && path.length > 0) {
+        paths.push(path);
+      }
+    }
+
+    // 模式 2: tee [-flags] path
+    const teeRe = /tee(?:\s+-[a-zA-Z0-9]+)*\s+([^\s|;&<>]+)/g;
+    while ((match = teeRe.exec(command)) !== null) {
+      const path = match[1];
+      if (path && path.length > 0) {
+        paths.push(path);
+      }
+    }
+
+    // 模式 3: dd if=... of=path
+    const ddRe = /\bdd\b.*?\bof=([^\s|;&<>]+)/g;
+    // reset lastIndex before use (regexes above may have consumed the string)
+    while ((match = ddRe.exec(command)) !== null) {
+      const path = match[1];
+      if (path && path.length > 0) {
+        paths.push(path);
+      }
+    }
+
+    return paths;
+  }
 
   /**
    * 将目标路径解析为绝对路径。

@@ -89,10 +89,11 @@ Commit Hash:
 - [x] Task 9: 记忆管理
 - [x] Task 10: 决策指纹匹配器
 - [x] Task 11: 反馈闭环
-- [ ] Task 12: Agent 主循环
-- [ ] Task 13: CLI 入口
-- [ ] Task 14: WebUI
+- [x] Task 12: Agent 主循环
+- [x] Task 13: CLI 入口
+- [x] Task 14: WebUI（⛔ 已弃用——项目定位单机 CLI，WebUI 审批无场景）
 - [ ] Task 15: 集成测试 + Docker + README
+- [ ] Task 16: 交互式多轮对话（chat 模式）
 
 ---
 
@@ -408,3 +409,186 @@ Task：Task 11 - 反馈闭环
 
 Commit Hash: `7c953a2`
 
+---
+
+### 📋 Task 12 完成
+
+时间：2026-08-11  
+Task：Task 12 - Agent 主循环  
+分支：`task/12-agent-loop`  
+
+**做了什么：** 实现 AgentLoop —— harness 核心引擎，用 while 循环（非递归）拼装全部 10 个子系统，驱动「上下文组装 → LLM 调用 → 解析 → 护栏 → HITL → 范围围栏 → 工具执行 → 反馈 → 停机判断」完整闭环。初始 15 个测试 → 经两轮 review 改进至 **29 个测试**，全量 423 测试零回归，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- **主循环**：while 循环 + 显式 break 条件（非递归），严格遵守 SPEC §3.1 流程图
+- **集成 10 个模块**：LLMProvider / ToolRegistry / ToolDispatcher / GuardrailEngine / HITLStateMachine / ScopeFenceGuard / DecisionFingerprint / SignalExtractor / FailureClassifier / FeedbackFormatter
+- **三层纵深防御完整串联**：GuardrailEngine（第二层）→ 决策指纹匹配（精确跳过/模糊降级/无匹配进 HITL）→ ScopeFenceGuard（第三层：路径边界 + 主机白名单）→ ToolDispatcher（第一层：硬黑名单时抛 GuardrailViolation）
+- **HITL 非阻塞**：submit → checkTimeout → 自动化模式默认拒绝；公开 `readonly hitl` 供 CLI/WebUI 外部审批
+- **反馈合并**：每轮只加一条 `[FEEDBACK]` system 消息，避免消息数组爆炸
+- **自动 checks 容错**：命令不可用时检测多种平台模式（bash "command not found" + 退出码 127 + Windows "not recognized"）→ 跳过并记 `[info]` 日志
+- **对话历史正确性**：tool_calls 响应 push assistant 消息 + 每个工具结果 push `role='tool'` 消息
+
+**测试覆盖（29 个，初始 15 + review 后 14）：**
+- 基础：3 轮循环 / maxRounds 超限 / LLM 错误 / 空任务 / 单轮完成 / 连续运行状态隔离
+- 护栏：deny 拦截 + 决策记录 / 多 tool_call 混合 deny+pass
+- HITL：timeout 自动拒绝 / 外部 approve 通过 / 模糊匹配进 HITL
+- 范围围栏：工作区外路径拒绝 / 工作区内路径放行 / curl 非白名单主机进 HITL
+- 反馈：未知工具错误 / 反馈注入下一轮 / 精确内容断言
+- Checks：工具不可用跳过 / 空配置快速路径 / 多平台错误检测
+- 边界：tool_calls 空数组 / content=null / 非 shell 工具指纹 / 记忆摘要注入 system prompt
+
+**代码 review 改进（两轮）：**
+
+第一轮 review —— **P0-P2 全面修复**：
+1. **P0-1**：新增模糊匹配 → HITL 流程测试
+2. **P0-2**：`hitl` 从 private 改为 `readonly` public，新增外部 approve 路径测试（通过 `onRequest` 回调模拟）
+3. **P0-3**：分析确认 GuardrailViolation catch 块**非死代码**——`ToolDispatcher.dispatch()` 是 `throw` 不是 `return`，`shutdown` 命令通过 GuardrailEngine 但被 Blacklist 拦截，catch 块可达。新增测试覆盖该链路。
+4. **P1-4/5**：**ScopeFenceGuard 集成到 processToolCall**（之前构造了但从未调用）——write_file 执行前 `validatePath()`，execute_shell 含 curl/wget 时 `validateHost()`
+5. **P1-6/7**：新增 runAutoChecks 跳过测试、混合 deny+pass 多 tool_call 测试
+6. **P2-8~10**：空 checks 快速路径、精确反馈内容断言、记忆摘要注入验证
+7. 新增 `extractCurlWgetUrl()` 辅助方法，移除未使用的 `round` 参数和 `FailureType` import
+
+第二轮 review —— **副作用消除**：
+1. **Point 1（误判）**：审核认为 GuardrailViolation catch 是死代码，经验证 `ToolDispatcher.dispatch()` L51-55 明确 `throw new GuardrailViolation()`，`shutdown -h now` 经 GuardrailEngine(无 action) → executeTool → Dispatcher throw → catch 捕获，完整链路可达
+2. **Point 2（正确）**：`ConfigLoader.DEFAULTS` 含 3 条 checks（`npx tsc --noEmit` / `npx eslint` / `npm test`），每个非 checks 测试都在后台执行这些真实命令。新增 `noChecksConfig`（空 checks 数组）替换所有非 checks 测试引用
+
+**关键设计决策与常见陷阱规避：**
+- ✅ while 循环非递归（防止栈溢出）
+- ✅ HITL 非阻塞（submit → checkTimeout → auto-deny，不同步等待）
+- ✅ tool_calls assistant 消息 + role='tool' 结果全部 push（LLM 能感知自己调了什么）
+- ✅ checks 不可用时跳过而非报 FAIL
+- ✅ 每轮一条 [FEEDBACK]（防止消息爆炸）
+- ✅ 工具执行关键信息写入对话历史（agent 知道上一步做了什么）
+
+Commit Hash: `5a8888f`
+
+---
+
+### 📋 Task 13 完成
+
+时间：2026-08-11  
+Task：Task 13 - CLI 入口  
+分支：`task/13-cli-entry`  
+做了什么：TDD 实现 CLI 入口（commander.js），提供 5 个子命令，9 个结构测试 + 全量 432 测试通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `createProgram()` — 导出函数模式，测试可 import 检查程序结构而不触发 `program.parse()`
+- `isEntryPoint()` — 通过 `process.argv[1]` + `fileURLToPath(import.meta.url)` 精确检测入口点，支持 tsx / 编译后 dist / 跨平台路径
+- 5 个子命令：`harness run <task>` / `harness setup` / `harness key status` / `harness key update` / `harness key delete`
+- `promptMasked()` — 在 TTY 环境启用 stdin raw mode，回显 `*`；非 TTY fallback 到 readline
+- `promptLine()` — 普通 readline 输入（HITL 审批提示）
+- `resolveApiKey()` — 优先 `DEEPSEEK_API_KEY` 环境变量 → 交互式密码解密（最多 3 次重试）
+- `buildDefaultConfigTemplate()` — setup 时自动写入 `.harnessrc.json` 默认配置模板（对齐 SPEC §3.6）
+
+**测试覆盖（9 个）：** 程序名/描述/命令注册/参数强制/选项存在/多次创建独立性/名称一致性/setup 无必需参数
+
+**代码 review 后改进：**
+1. `harness setup` 原仅打印提示不生成文件 → 新增 `buildDefaultConfigTemplate()` 写入完整 `.harnessrc.json`
+
+Commit Hash: `5a7dd6a`
+
+---
+
+### 🔀 跨 Task 工作：交互式 HITL 审批集成（Task 7 + 12 + 13）
+
+时间：2026-08-11  
+涉及分支：`task/13-cli-entry`（同一分支内完成的额外改进）  
+审核问题：SPEC §3.3 要求 CLI 交互模式弹出 `⚠️ 危险操作: [详情] (A)pprove / (D)eny?`，但当前 CLI 未注册 HITL 回调——所有 confirm 操作被 auto-deny。
+
+**改动范围（3 个文件，跨 3 个 Task 的模块）：**
+
+| 文件 | 所属 Task | 改动 |
+|------|----------|------|
+| `src/guardrails/hitl.ts` | Task 7 | 新增 `waitForResolution(id, timeoutSeconds)` —— 100ms 间隔轮询等待请求解析（外部 approve/deny 或超时） |
+| `src/core/agent-loop.ts` | Task 12 | `handleHITL()` 重构：从「submit → 立刻 auto-deny」改为「submit → await waitForResolution → 根据状态执行/拒绝」 |
+| `src/cli/index.ts` | Task 13 | `harness run` 注册 `loop.hitl.onRequest` 回调，弹出终端审批提示；新增 `promptLine()` 辅助函数 |
+
+**数据流变化：**
+```
+改前：submit → checkTimeout → getRequest → WAITING → auto-deny（用户永远无法审批）
+改后：submit → onRequest 回调 → CLI 弹出 ⚠️ 提示 → waitForResolution → APPROVED/DENIED/TIMEOUT
+```
+
+**新增测试：** `tests/unit/hitl.test.ts` +6 个 `waitForResolution()` 测试（外部 approve/deny/timeout/未知 ID/onResolved 回调/同步预先 approve），全量 438 测试零回归。
+
+Commit Hash: `61f393c`
+
+---
+
+### 🔧 跨 Task 修复：非 TTY 环境 HITL 阻塞（Task 12）
+
+时间：2026-08-12  
+审核问题：在 CI/Docker/管道等非 TTY 环境，无 `onRequest` 回调 → `waitForResolution` 轮询等待完整 `timeoutSeconds`（默认 60s）才超时。3 个 confirm 操作 = 额外 3 分钟阻塞。
+
+**修复：** `handleHITL()` 中 `submit` 后检查 `!this.hitl.onRequest` → 无人值守模式直接 `deny`（< 1ms），不调用 `waitForResolution`。仅 4 行逻辑，全量 438 测试零回归。
+
+Commit Hash: `53576ac`
+
+---
+
+### 🔀 跨 Task 工作：CLI 端到端验证 + DeepSeek API 消息格式修复（Task 12 + 13 + LLM 层）
+
+时间：2026-08-12  
+涉及分支：`task/13-cli-entry`  
+审核问题：在真实 DeepSeek API 环境下端到端验证 CLI 全部功能时，`harness run` 在 2 轮后报 error 退出，LLM 调用返回 400。
+
+**排查过程：**
+1. 第一步：发现 DeepSeek provider 在 catch 块中静默吞掉错误信息 → 加 `console.error` 打印诊断消息
+2. 第二步：拿到具体报错 `missing field 'tool_call_id'` → 根因是内部 `Message` 接口使用 `toolCallId`（camelCase），但 `deepseek.ts` 直接 `as OpenAI.Chat.ChatCompletionMessageParam[]` 强转，OpenAI SDK 期望 `tool_call_id`（snake_case）
+3. 第三步：修复后又报 `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'` → 根因是 `buildAssistantMessage()` 将 tool_calls 序列化为纯文本 `[Tool calls: ...]` 而非结构化数组，API 不认后续的 `tool` 消息
+
+**改动范围（3 个文件，跨 3 个模块）：**
+
+| 文件 | 所属模块 | 改动 |
+|------|---------|------|
+| `src/llm/deepseek.ts` | LLM 抽象层 (Task 1) | ① catch 块新增 `console.error` 打印 API 错误详情 ② 新增 `toOpenAIMessages()` 函数，将内部 Message 转换为 OpenAI snake_case 格式（`toolCallId` → `tool_call_id`、`toolCalls` → `tool_calls` 结构化数组） |
+| `src/core/types.ts` | 核心类型 (Task 0) | `Message` 接口新增可选字段 `toolCalls?: ToolCall[]`，承载 assistant 消息的结构化 tool_calls 数据 |
+| `src/core/agent-loop.ts` | Agent 主循环 (Task 12) | `buildAssistantMessage()` 从纯文本 `[Tool calls: ...]` 改为携带原始 `toolCalls` 数组，确保 API 能识别后续 tool 消息的归属 |
+
+**⚠️ 影响面说明：**
+- `Message` 接口新增 `toolCalls` 字段是**向后兼容**的（optional），所有存量测试保持绿色
+- `buildAssistantMessage` 的行为变更**涉及 AgentLoop 核心数据流**：改前 assistant 消息的 tool_calls 信息以纯文本嵌入 content，改后以结构化字段传递。这改变了消息在 LLM 眼中的语义（从"一段文字"变为"正式的 function call 请求"），但也因此才符合 OpenAI/DeepSeek API 规范
+- `toOpenAIMessages()` 是 LLM 层的**唯一消息格式转换点**，未来如果换 provider 只需改这一个函数
+
+**验证结果：**
+- ✅ `harness --help` / `--version` — 正常
+- ✅ `harness setup` — 凭据加密保存 + `.harnessrc.json` 模板生成
+- ✅ `harness run "写一个 TypeScript 快速排序函数"` — 4 轮完成，生成 `quicksort.ts` 并通过 `tsc --noEmit` 类型检查
+- ⬜ `harness key status/update/delete` — 待验证
+- ⬜ HITL 交互审批 — 待验证
+
+Commit Hash: `966719f`
+
+---
+
+### 🔀 跨 Task 工作：范围围栏 shell 重定向路径校验（Task 8 + 12 + 13）
+
+时间：2026-08-12  
+涉及分支：`task/13-cli-entry`  
+审核问题：agent 用 `execute_shell` 的 `echo > ../test.txt` 绕过 write_file 护栏，将文件写入工作区外。先尝试加护栏规则堵，agent 换 `cd .. && echo > test.txt` 再次绕过——护栏规则是"打地鼠"，shell 表达力无限，追不上。
+
+**最终方案：** 在范围围栏（第三层）新增 `validateShellCommand()`，从 shell 命令中正则提取输出目标路径（`>` / `>>` / `tee` / `dd of=`），逐一经 `validatePath()` 做工作区边界校验。提取不到 → 放行（保守）；任一越界 → 硬拒绝。
+
+**改动范围（4 个文件，跨 3 个模块）：**
+
+| 文件 | 所属模块 | 改动 |
+|------|---------|------|
+| `src/guardrails/scope-fence.ts` | 范围围栏 (Task 8) | 新增 `validateShellCommand()` 公开方法 + `extractShellOutputPaths()` 私有方法，覆盖 3 类输出模式 |
+| `src/core/agent-loop.ts` | Agent 主循环 (Task 12) | `processToolCall()` 的 `execute_shell` 分支中，在主机白名单检查之前新增 shell 路径校验（硬拒绝） |
+| `src/cli/index.ts` | CLI 入口 (Task 13) | `buildDefaultConfigTemplate()` 新增 2 条护栏规则（`> ../` Unix + `> ..\` Windows） |
+| `.harnessrc.json` | 配置模板 | 同步新增 2 条护栏规则 |
+| `tests/unit/scope-fence.test.ts` | 测试 | +19 个测试（重定向穿越 / 绝对路径 / tee / dd / 工作区内正常放行 / 空命令 / cd 绕过已知局限 / 状态隔离） |
+
+**⚠️ 影响面说明：**
+- `ScopeFenceGuard` 新增方法是**纯增量**——不修改已有 `validatePath()` / `validateHost()` 的行为
+- `agent-loop.ts` 的改动在已有的 `execute_shell` 分支内，与主机白名单检查并列，不改变控制流结构
+- 护栏规则新增在配置模板中，存量用户 `.harnessrc.json` 不会被覆盖（setup 不覆盖已有配置）
+- **已知局限（JSDoc 显式标注）**：`cd .. && echo hello > test.txt` 无法静态检测——cd 改变进程 CWD，字符串层面无法判定最终落点。这是 shell 灵活性的固有限制
+
+**测试结果：** 全量 457 测试零回归，`npx tsc --noEmit` 零错误。
+
+**E2E 验证：**
+- `harness run "echo hello > /etc/hosts"` → 范围围栏直接硬拒绝（无弹窗）
+- `harness run "echo hello > ../test.txt"` → 护栏规则先匹配弹 HITL → 拒绝后 agent 不再尝试
+
+Commit Hash: `798c03b`

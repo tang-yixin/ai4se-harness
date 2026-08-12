@@ -3470,9 +3470,11 @@ git commit -m "feat(cli): add CLI entry with run, setup, and key management comm
 
 ---
 
-### Task 14: WebUI（轻量仪表盘）
+### Task 14: WebUI（轻量仪表盘）— ⛔ 已弃用
 
-**目的：** 实现 Express + SSE 的 HITL 审批 Web 接口。
+> **弃用说明（2026-08-12）：** 项目定位为单机 CLI 工具，HITL 审批已通过 CLI TTY 弹窗完成，WebUI 审批无实际使用场景。SPEC 中相关 WebUI 内容已同步标记弃用。此 task 跳过，不再实现。
+
+**目的：** ~~实现 Express + SSE 的 HITL 审批 Web 接口。~~
 
 **依赖：** Task 12 (AgentLoop), Task 7 (HITL StateMachine)
 
@@ -3718,7 +3720,7 @@ git commit -m "feat(webui): add Express + SSE web server for HITL approval"
 
 **目的：** 端到端集成测试、Dockerfile、README 文档，完成项目交付。
 
-**依赖：** Task 13 (CLI), Task 14 (WebUI)
+**依赖：** Task 13 (CLI)（Task 14 WebUI 已弃用，不再依赖）
 
 **分支：** `task/15-integration-docker`
 
@@ -3780,6 +3782,120 @@ git commit -m "feat: add Dockerfile, CI config, and README"
 
 ---
 
+### Task 16: 交互式多轮对话（chat 模式）
+
+**目的：** 在 CLI 中新增 `harness chat` 子命令，支持用户与 agent 持续多轮对话，agent 记住上下文继续工作（而非每次 run 一个独立任务）。
+
+**依赖：** Task 12 (AgentLoop), Task 13 (CLI)
+
+**分支：** `task/16-interactive-chat`
+
+**背景：** 当前 `harness run "任务"` 是「一次任务一次进程」，`AgentLoop.run()` 内部虽保留了完整 `messages[]`（system prompt + 用户任务 + assistant 回复 + 工具结果 + 反馈），但方法返回后该数组销毁。本 task 将消息历史暴露并跨轮复用，实现类似结对编程的持续对话体验。
+
+**Files:**
+- Modify: `src/core/agent-loop.ts`（新增 `continue()` 方法 + `messages` getter）
+- Modify: `src/core/types.ts`（`AgentResult` 扩展返回消息历史）
+- Modify: `src/cli/index.ts`（新增 `harness chat` 子命令 + REPL 循环）
+- Create: `tests/unit/agent-loop-continue.test.ts`
+
+**Interfaces:**
+- Produces:
+  - `AgentLoop.continue(task: string): Promise<AgentResult>` — 在已有消息历史上追加用户消息继续循环，而非重建 system prompt
+  - `AgentLoop.getMessages(): Message[]` — 返回当前会话消息历史（只读副本）
+  - `AgentResult.messages?: Message[]` — 可选返回最终消息历史
+
+---
+
+- [ ] **Step 1: 实现 AgentLoop.continue()**
+
+在 `src/core/agent-loop.ts` 中：
+
+1. 将 `messages` 从 `run()` 的局部变量提升为实例属性（或新增 `private messages: Message[]`）
+2. 新增 `continue(task: string, maxRounds = 50): Promise<AgentResult>`：
+   - 复用已有 `messages`（含之前的 system prompt、assistant 回复、工具结果、反馈）
+   - 追加一条 `{ role: 'user', content: task }`
+   - 进入主循环（逻辑与 `run()` 尾部相同，抽公共方法避免重复）
+3. 新增 `getMessages(): Message[]` 返回只读副本
+4. `run()` 内部改为：初始化 `messages` → 复用 `continue` 的循环逻辑（保持向后兼容，`run` 语义不变）
+
+**注意：** 主循环逻辑（LLM 调用 → 护栏 → 执行 → 反馈 → 停机判断）需抽取为公共私有方法 `runLoop(task, maxRounds)`，`run()` 和 `continue()` 共用，避免代码重复。
+
+---
+
+- [ ] **Step 2: 扩展 AgentResult 类型**
+
+在 `src/core/types.ts` 中 `AgentResult` 接口新增可选字段：
+
+```typescript
+export interface AgentResult {
+  success: boolean;
+  rounds: number;
+  summary: string;
+  phase: AgentPhase;
+  messages?: Message[];  // 最终消息历史（供 chat 模式复用）
+}
+```
+
+---
+
+- [ ] **Step 3: 实现 harness chat 子命令**
+
+在 `src/cli/index.ts` 中新增 `chat` 命令：
+
+```typescript
+program
+  .command('chat')
+  .description('Interactive multi-turn chat with the agent')
+  .action(async () => {
+    // 1. 加载配置 + 解析 API key（复用 run 的初始化逻辑）
+    // 2. 初始化 llm / tools / memory / loop（同一实例复用）
+    // 3. 注册 loop.hitl.onRequest 回调（同 run）
+    // 4. 创建 readline 接口，进入 READ-EVAL-PRINT 循环：
+    //    - 打印 "harness> " 提示符
+    //    - 读用户输入，空行跳过，输入 exit/quit 退出
+    //    - 首次输入 → loop.run(input)；后续输入 → loop.continue(input)
+    //    - 打印 agent 结果摘要
+  });
+```
+
+**注意：** 复用同一 `AgentLoop` 实例，确保 `MemoryStore`（决策记忆）跨轮持久，避免重复弹 HITL。
+
+---
+
+- [ ] **Step 4: 写失败测试**
+
+创建 `tests/unit/agent-loop-continue.test.ts`，用 mock LLM 验证：
+
+1. `run()` 后 `continue()` 的消息历史包含第一轮的 assistant 回复和工具结果
+2. `continue()` 追加 user 消息而非重建 system prompt（断言 messages[0] 仍是 system、不重复）
+3. `continue()` 复用同一 MemoryStore 决策记录（第一轮 approved 的决策在第二轮仍生效）
+4. `getMessages()` 返回只读副本（修改返回值不影响内部状态）
+5. `run()` 向后兼容（原有测试不受影响）
+
+---
+
+- [ ] **Step 5: 运行测试确认失败 → 实现 → 确认通过**
+
+```bash
+npx vitest run tests/unit/agent-loop-continue.test.ts
+npx tsc --noEmit
+npx vitest run
+```
+
+预期：新测试通过 + 全量零回归。
+
+---
+
+- [ ] **Step 6: Commit**
+
+```bash
+git checkout -b task/16-interactive-chat
+git add src/core/agent-loop.ts src/core/types.ts src/cli/index.ts tests/unit/agent-loop-continue.test.ts
+git commit -m "feat(cli): add interactive multi-turn chat mode"
+```
+
+---
+
 ## 依赖图与并行策略
 
 ```
@@ -3801,21 +3917,21 @@ Task 0 (scaffold + types)
                                                 ▼
                                          Task 12 (agent loop)
                                                 │
+                                                ▼
+                                         Task 13 (CLI)
+                                                │
                               ┌─────────────────┴──────────────────┐
                               ▼                                    ▼
-                         Task 13 (CLI)                      Task 14 (WebUI)
-                              │                                    │
-                              └─────────────────┬──────────────────┘
-                                                ▼
-                                         Task 15 (integration + docker)
+                         Task 15 (integration + docker)      Task 16 (interactive chat)
 ```
 
 **可并行组：**
 - 组 A（Task 0 之后）：Task 1, 2, 3, 4, 9, 6, 11 — 7 个 task 可同时开工
 - 组 B（Task 4 + 6 之后）：Task 5, 7, 8 — 3 个 task 可并行
-- 组 C（Task 12 之后）：Task 13, 14 — 2 个 task 可并行
+- ~~组 C（Task 12 之后）：Task 13, 14 — 2 个 task 可并行~~（Task 14 已弃用）
+- 组 D（Task 13 之后）：Task 15, 16 — 2 个 task 可并行（都只依赖 Task 13）
 
-**总计 16 个 task（Task 0 到 Task 15），预计工作量约 8–12 小时。**
+**总计 17 个 task（Task 0 到 Task 16，其中 Task 14 已弃用跳过），预计工作量约 8–12 小时。**
 
 ---
 

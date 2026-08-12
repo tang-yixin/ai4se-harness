@@ -9,6 +9,8 @@ export interface Message {
   content: string;
   toolCallId?: string;
   name?: string;
+  /** Assistant 消息中的 tool_calls（与 OpenAI/DeepSeek API 兼容） */
+  toolCalls?: ToolCall[];
 }
 
 export interface ToolDef {

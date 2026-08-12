@@ -138,6 +138,68 @@ export class HITLStateMachine {
     return this.pending.get(id) ?? this.history.find((r) => r.id === id);
   }
 
+  /**
+   * 异步等待请求被解析（审批 / 拒绝 / 超时）。
+   *
+   * 以 100ms 间隔轮询请求状态：
+   *   - 若请求被外部 approve()/deny() 解析 → 返回对应终态
+   *   - 若请求超时（当前时间 - createdAt > timeoutSeconds * 1000）
+   *     → 标记为 TIMEOUT 并返回
+   *   - 若请求不存在（ID 无效或已从所有 Map 移除）→ 返回 TIMEOUT
+   *
+   * 此方法是 CLI 交互式审批的关键：CLI 注册 onRequest 回调
+   * 提示用户输入，主循环通过此方法阻塞等待用户决策。
+   *
+   * @param id             请求 ID
+   * @param timeoutSeconds 超时秒数（与请求创建时设置的一致）
+   * @returns 最终状态：'APPROVED' | 'DENIED' | 'TIMEOUT'
+   */
+  async waitForResolution(
+    id: string,
+    timeoutSeconds: number,
+  ): Promise<'APPROVED' | 'DENIED' | 'TIMEOUT'> {
+    const deadline = Date.now() + timeoutSeconds * 1000;
+
+    while (Date.now() < deadline) {
+      // 检查请求当前状态
+      const req = this.getRequest(id);
+
+      // 请求不存在 → 视为超时（防御性）
+      if (!req) {
+        return 'TIMEOUT';
+      }
+
+      // 已被外部 approve()/deny() 解析
+      if (req.status !== 'WAITING') {
+        return req.status as 'APPROVED' | 'DENIED' | 'TIMEOUT';
+      }
+
+      // 检查超时
+      const elapsed = Date.now() - req.createdAt;
+      if (elapsed >= timeoutSeconds * 1000) {
+        req.status = 'TIMEOUT';
+        this.pending.delete(id);
+        this.history.push(req);
+        this.onResolved?.(req);
+        return 'TIMEOUT';
+      }
+
+      // 等待下一轮轮询（~100ms）
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    // deadline 已过 → 超时
+    const finalReq = this.getRequest(id);
+    if (finalReq && finalReq.status === 'WAITING') {
+      finalReq.status = 'TIMEOUT';
+      this.pending.delete(id);
+      this.history.push(finalReq);
+      this.onResolved?.(finalReq);
+    }
+
+    return 'TIMEOUT';
+  }
+
   // ============================================================
   // 私有方法
   // ============================================================

@@ -184,7 +184,7 @@ IDLE → WAITING → APPROVED → 执行
 
 **HITL 审批通道：**
 - **交互模式**：CLI 终端直接弹出确认提示 `⚠️ 危险操作: [详情] (A)pprove / (D)eny?`
-- **自动化模式**：WebUI（`localhost:3099`）提供 HTTP 审批接口（`POST /hitl/:id/approve`、`POST /hitl/:id/deny`）+ SSE 实时推送
+- ~~**自动化模式**：WebUI（`localhost:3099`）提供 HTTP 审批接口（`POST /hitl/:id/approve`、`POST /hitl/:id/deny`）+ SSE 实时推送~~（已弃用——项目定位为单机 CLI 工具，WebUI 审批无实际场景）
 
 ### 3.4 反馈闭环
 
@@ -339,12 +339,12 @@ IDLE → WAITING → APPROVED → 执行
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                      用户接口层                           │
-│   ┌──────────┐  ┌──────────┐  ┌──────────────────────┐   │
-│   │ CLI 入口 │  │  WebUI   │  │ 配置命令(status/      │   │
-│   │(交互模式)│  │(仪表盘)  │  │ update/delete/setup)  │   │
-│   └────┬─────┘  └────┬─────┘  └──────────┬───────────┘   │
-│        └──────────────┼──────────────────┘               │
-│                       ▼                                   │
+│   ┌──────────┐  ┌──────────────────────┐                 │
+│   │ CLI 入口 │  │ 配置命令(status/      │                 │
+│   │(交互模式)│  │ update/delete/setup)  │                 │
+│   └────┬─────┘  └──────────┬───────────┘                 │
+│        └───────────────┬───┘                             │
+│                        ▼                                  │
 │              Agent 主循环 (AgentLoop)                      │
 │   ┌────────────────────────────────────────────────────┐  │
 │   │  ①上下文组装 → ②LLM调用 → ③解析响应 →             │  │
@@ -392,7 +392,7 @@ IDLE → WAITING → APPROVED → 执行
 | OpenAI Node.js SDK (`openai`) | LLM API 调用 | 无（核心依赖） |
 | Node.js `crypto` 模块 | AES-256-GCM 加解密 | 无（标准库） |
 | `commander.js` | CLI 参数解析 | `yargs` |
-| `express` | WebUI HTTP 服务 | 无（轻量够用） |
+| `express` | ~~WebUI HTTP 服务~~（已弃用） | 无 |
 
 ### 5.4 源代码包结构
 
@@ -434,8 +434,8 @@ ai4se-harness/
 │   │   └── store.ts           #   CredentialStore（PBKDF2 + AES-256-GCM）
 │   ├── cli/                   # CLI 入口
 │   │   └── index.ts           #   commander.js 入口
-│   └── web/                   # WebUI（轻量仪表盘）
-│       └── server.ts          #   Express + SSE
+│   └── web/                   # ~~WebUI（轻量仪表盘）~~（已弃用）
+│       └── server.ts          #   ~~Express + SSE~~
 ├── tests/
 │   ├── unit/                  # 单元测试（mock LLM，零网络依赖）
 │   │   ├── agent-loop.test.ts
@@ -671,16 +671,16 @@ docker run -it --rm -v $(pwd):/workspace ai4se-harness run "你的任务"
 
 | 项 | 选型 | 理由 |
 |----|------|------|
-| 语言 | TypeScript | 静态类型在 TDD + subagent 迭代中提供编译期错误捕捉；全栈统一（CLI + WebUI 同一语言）；对 AI 生成的代码有更好的接口约束 |
+| 语言 | TypeScript | 静态类型在 TDD + subagent 迭代中提供编译期错误捕捉；CLI 全栈统一语言；对 AI 生成的代码有更好的接口约束 |
 | 运行时 | Node.js ≥ 18 | LTS 版本，生态成熟 |
 | LLM SDK | OpenAI SDK (`openai` npm 包) | DeepSeek API 与 OpenAI 兼容，通过设置 `baseURL` 接入；AI 对此 SDK 的代码生成最准确 |
 | LLM 模型 | DeepSeek Chat | 成本低、tool calling 支持、中文友好 |
 | CLI 框架 | `commander.js` | 轻量、TypeScript 类型支持好、社区成熟 |
-| WebUI | Express + SSE | 轻量（不做 SPA）、SSE 天然适合实时状态推送 |
+| ~~WebUI~~ | ~~Express + SSE~~ | ~~轻量（不做 SPA）、SSE 天然适合实时状态推送~~（已弃用） |
 | 加密 | Node.js `crypto` 模块（AES-256-GCM + PBKDF2） | 标准库无额外依赖、算法选择符合工业标准 |
 | 测试框架 | Vitest | 原生 ESM + TypeScript 支持、与 Vite 生态一致、速度快 |
 | CI/CD | GitHub Actions | 免费额度、与 GitHub 仓库深度集成 |
-| 部署 | 任选 Vercel / Railway（学生免费额度） | WebUI 仅需轻量 HTTP 服务，无数据库 |
+| 部署 | ~~任选 Vercel / Railway（学生免费额度）~~（已弃用） | ~~WebUI 仅需轻量 HTTP 服务，无数据库~~ |
 | 分发 | npm（主）+ Docker（辅） | npm 面向 TS/JS 开发者最自然；Docker 兜底任意环境 |
 
 ---
@@ -698,7 +698,7 @@ docker run -it --rm -v $(pwd):/workspace ai4se-harness run "你的任务"
 | 7 | 配置加载 | 删除 `.harnessrc.json` → 使用默认配置运行 → 配置错误（如无效正则）→ 启动时报错退出 |
 | 8 | 一键测试 | `npm test` 或 `make test` 运行全部单元测试且全绿（零网络依赖） |
 | 9 | CI pass | GitHub Actions 中 `unit-test` job 通过 |
-| 10 | WebUI 可访问 | `localhost:3099/status` 返回当前会话状态 JSON |
+| 10 | ~~WebUI 可访问~~（已弃用） | ~~`localhost:3099/status` 返回当前会话状态 JSON~~ |
 | 11 | npm 安装 | `npm install -g` 后 `harness --version` 输出版本号 |
 | 12 | Docker 运行 | `docker run ai4se-harness --version` 输出版本号 |
 
