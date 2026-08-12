@@ -523,4 +523,38 @@ Commit Hash: `61f393c`
 
 Commit Hash: `53576ac`
 
+---
+
+### 🔀 跨 Task 工作：CLI 端到端验证 + DeepSeek API 消息格式修复（Task 12 + 13 + LLM 层）
+
+时间：2026-08-12  
+涉及分支：`task/13-cli-entry`  
+审核问题：在真实 DeepSeek API 环境下端到端验证 CLI 全部功能时，`harness run` 在 2 轮后报 error 退出，LLM 调用返回 400。
+
+**排查过程：**
+1. 第一步：发现 DeepSeek provider 在 catch 块中静默吞掉错误信息 → 加 `console.error` 打印诊断消息
+2. 第二步：拿到具体报错 `missing field 'tool_call_id'` → 根因是内部 `Message` 接口使用 `toolCallId`（camelCase），但 `deepseek.ts` 直接 `as OpenAI.Chat.ChatCompletionMessageParam[]` 强转，OpenAI SDK 期望 `tool_call_id`（snake_case）
+3. 第三步：修复后又报 `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'` → 根因是 `buildAssistantMessage()` 将 tool_calls 序列化为纯文本 `[Tool calls: ...]` 而非结构化数组，API 不认后续的 `tool` 消息
+
+**改动范围（3 个文件，跨 3 个模块）：**
+
+| 文件 | 所属模块 | 改动 |
+|------|---------|------|
+| `src/llm/deepseek.ts` | LLM 抽象层 (Task 1) | ① catch 块新增 `console.error` 打印 API 错误详情 ② 新增 `toOpenAIMessages()` 函数，将内部 Message 转换为 OpenAI snake_case 格式（`toolCallId` → `tool_call_id`、`toolCalls` → `tool_calls` 结构化数组） |
+| `src/core/types.ts` | 核心类型 (Task 0) | `Message` 接口新增可选字段 `toolCalls?: ToolCall[]`，承载 assistant 消息的结构化 tool_calls 数据 |
+| `src/core/agent-loop.ts` | Agent 主循环 (Task 12) | `buildAssistantMessage()` 从纯文本 `[Tool calls: ...]` 改为携带原始 `toolCalls` 数组，确保 API 能识别后续 tool 消息的归属 |
+
+**⚠️ 影响面说明：**
+- `Message` 接口新增 `toolCalls` 字段是**向后兼容**的（optional），所有存量测试保持绿色
+- `buildAssistantMessage` 的行为变更**涉及 AgentLoop 核心数据流**：改前 assistant 消息的 tool_calls 信息以纯文本嵌入 content，改后以结构化字段传递。这改变了消息在 LLM 眼中的语义（从"一段文字"变为"正式的 function call 请求"），但也因此才符合 OpenAI/DeepSeek API 规范
+- `toOpenAIMessages()` 是 LLM 层的**唯一消息格式转换点**，未来如果换 provider 只需改这一个函数
+
+**验证结果：**
+- ✅ `harness --help` / `--version` — 正常
+- ✅ `harness setup` — 凭据加密保存 + `.harnessrc.json` 模板生成
+- ✅ `harness run "写一个 TypeScript 快速排序函数"` — 4 轮完成，生成 `quicksort.ts` 并通过 `tsc --noEmit` 类型检查
+- ⬜ `harness key status/update/delete` — 待验证
+- ⬜ HITL 交互审批 — 待验证
+
+Commit Hash: `966719f`
 

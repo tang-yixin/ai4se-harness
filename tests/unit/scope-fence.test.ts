@@ -388,3 +388,177 @@ describe('ScopeFenceGuard.validatePath — 相对路径解析', () => {
     expect(result.allowed).toBe(true);
   });
 });
+
+// ============================================================
+// validateShellCommand — shell 重定向路径校验
+// ============================================================
+
+describe('ScopeFenceGuard.validateShellCommand', () => {
+  // ---- 输出重定向 > ----
+
+  it('拒绝 > ../ 相对穿越（Unix）', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello > ../outside.txt',
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('之外');
+  });
+
+  it('拒绝 > ../ 无空格写法', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello >../outside.txt',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  it('拒绝 >> ../ 追加重定向穿越', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello >> ../outside.txt',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  it('拒绝 1> ../ fd 重定向穿越', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'cmd 1> ../out.txt 2> ../err.txt',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  it('拒绝 &> ../ bash 合并重定向', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'cmd &> ../all.txt',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  // ---- tee ----
+
+  it('拒绝 tee ../ 写入父目录', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello | tee ../outside.txt',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  it('拒绝 tee -a ../ 追加写入父目录', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello | tee -a ../outside.txt',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  // ---- dd ----
+
+  it('拒绝 dd of=../ 写入父目录', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'dd if=/dev/zero of=../outside.img bs=1M count=1',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  // ---- 绝对路径越界 ----
+
+  it('拒绝 > /etc/hosts 绝对路径写入系统目录', () => {
+    const guard = makeGuard({ workspaceRoot: '/home/user/project' });
+    const result = guard.validateShellCommand(
+      "echo '127.0.0.1 evil.com' > /etc/hosts",
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  it('拒绝 > C:\\Windows\\System32 绝对路径（Windows 盘符）', () => {
+    const guard = makeGuard({ workspaceRoot: 'C:\\Users\\dev\\project' });
+    const result = guard.validateShellCommand(
+      'echo x > C:\\Windows\\System32\\drivers\\etc\\hosts',
+    );
+    expect(result.allowed).toBe(false);
+  });
+
+  // ---- 工作区内正常命令（不误拦） ----
+
+  it('允许 > ./file.txt 工作区内相对路径', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello > ./output.txt',
+    );
+    expect(result.allowed).toBe(true);
+  });
+
+  it('允许 > file.txt 无路径前缀', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello > output.txt',
+    );
+    expect(result.allowed).toBe(true);
+  });
+
+  it('允许无重定向的纯读命令', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand('ls -la');
+    expect(result.allowed).toBe(true);
+  });
+
+  it('允许 echo 无重定向（字符串中含 ../）', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand("echo '../outside.txt'");
+    expect(result.allowed).toBe(true);
+  });
+
+  it('允许 tee 工作区内文件', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'echo hello | tee ./output.txt',
+    );
+    expect(result.allowed).toBe(true);
+  });
+
+  // ---- 空 / 边界 ----
+
+  it('允许空命令', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand('');
+    expect(result.allowed).toBe(true);
+  });
+
+  it('允许纯空白命令', () => {
+    const guard = makeGuard();
+    const result = guard.validateShellCommand('   ');
+    expect(result.allowed).toBe(true);
+  });
+
+  // ---- 已知局限：cd 绕过 ----
+
+  it('已知局限：cd .. && echo > test.txt 无法静态检测（允许放行）', () => {
+    // 此测试记录了 cd 绕过的已知局限。
+    // shell 的 cd 改变了进程 CWD，字符串层面无法静态判定 test.txt 最终位置。
+    const guard = makeGuard();
+    const result = guard.validateShellCommand(
+      'cd .. && echo hello > test.txt',
+    );
+    // 目前无法拦截——test.txt 不含 ../ 也不含绝对前缀
+    expect(result.allowed).toBe(true);
+  });
+
+  // ---- 多次调用不累积状态 ----
+
+  it('连续多次 validateShellCommand 调用互不干扰', () => {
+    const guard = makeGuard();
+
+    const r1 = guard.validateShellCommand('echo hello > ./ok.txt');
+    const r2 = guard.validateShellCommand('echo bad > ../outside.txt');
+    const r3 = guard.validateShellCommand('ls -la');
+
+    expect(r1.allowed).toBe(true);
+    expect(r2.allowed).toBe(false);
+    expect(r3.allowed).toBe(true);
+  });
+});

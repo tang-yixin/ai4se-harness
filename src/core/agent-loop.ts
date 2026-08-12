@@ -263,6 +263,27 @@ export class AgentLoop {
 
     // execute_shell: 检测对非白名单主机的网络请求 → 触发 confirm
     if (toolCall.name === 'execute_shell' && typeof toolCall.arguments.command === 'string') {
+      // 校验 shell 重定向输出路径不越界（硬拒绝，同 write_file 的范围围栏）
+      const shellPathResult = this.scopeFence.validateShellCommand(
+        toolCall.arguments.command,
+      );
+      if (!shellPathResult.allowed) {
+        const fenceFeedback: Feedback = {
+          success: false,
+          failureType: 'GUARDRAIL_DENY',
+          suggestion:
+            'Redirect output to a path within the workspace root, or use write_file instead.',
+          summary: `✗ ${toolCall.name} SCOPE FENCE BLOCK: shell redirect targets outside workspace — ${shellPathResult.reason}`,
+          rawOutput: shellPathResult.reason ?? '',
+        };
+        messages.push({
+          role: 'tool',
+          content: `SCOPE FENCE BLOCK: ${shellPathResult.reason}`,
+          toolCallId: toolCall.id,
+        });
+        return fenceFeedback;
+      }
+
       const hostUrl = this.extractCurlWgetUrl(toolCall.arguments.command);
       if (hostUrl) {
         const hostResult = this.scopeFence.validateHost(hostUrl);
