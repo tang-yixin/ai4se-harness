@@ -91,8 +91,9 @@ Commit Hash:
 - [x] Task 11: 反馈闭环
 - [x] Task 12: Agent 主循环
 - [x] Task 13: CLI 入口
-- [ ] Task 14: WebUI
+- [x] Task 14: WebUI（⛔ 已弃用——项目定位单机 CLI，WebUI 审批无场景）
 - [ ] Task 15: 集成测试 + Docker + README
+- [ ] Task 16: 交互式多轮对话（chat 模式）
 
 ---
 
@@ -558,3 +559,36 @@ Commit Hash: `53576ac`
 
 Commit Hash: `966719f`
 
+---
+
+### 🔀 跨 Task 工作：范围围栏 shell 重定向路径校验（Task 8 + 12 + 13）
+
+时间：2026-08-12  
+涉及分支：`task/13-cli-entry`  
+审核问题：agent 用 `execute_shell` 的 `echo > ../test.txt` 绕过 write_file 护栏，将文件写入工作区外。先尝试加护栏规则堵，agent 换 `cd .. && echo > test.txt` 再次绕过——护栏规则是"打地鼠"，shell 表达力无限，追不上。
+
+**最终方案：** 在范围围栏（第三层）新增 `validateShellCommand()`，从 shell 命令中正则提取输出目标路径（`>` / `>>` / `tee` / `dd of=`），逐一经 `validatePath()` 做工作区边界校验。提取不到 → 放行（保守）；任一越界 → 硬拒绝。
+
+**改动范围（4 个文件，跨 3 个模块）：**
+
+| 文件 | 所属模块 | 改动 |
+|------|---------|------|
+| `src/guardrails/scope-fence.ts` | 范围围栏 (Task 8) | 新增 `validateShellCommand()` 公开方法 + `extractShellOutputPaths()` 私有方法，覆盖 3 类输出模式 |
+| `src/core/agent-loop.ts` | Agent 主循环 (Task 12) | `processToolCall()` 的 `execute_shell` 分支中，在主机白名单检查之前新增 shell 路径校验（硬拒绝） |
+| `src/cli/index.ts` | CLI 入口 (Task 13) | `buildDefaultConfigTemplate()` 新增 2 条护栏规则（`> ../` Unix + `> ..\` Windows） |
+| `.harnessrc.json` | 配置模板 | 同步新增 2 条护栏规则 |
+| `tests/unit/scope-fence.test.ts` | 测试 | +19 个测试（重定向穿越 / 绝对路径 / tee / dd / 工作区内正常放行 / 空命令 / cd 绕过已知局限 / 状态隔离） |
+
+**⚠️ 影响面说明：**
+- `ScopeFenceGuard` 新增方法是**纯增量**——不修改已有 `validatePath()` / `validateHost()` 的行为
+- `agent-loop.ts` 的改动在已有的 `execute_shell` 分支内，与主机白名单检查并列，不改变控制流结构
+- 护栏规则新增在配置模板中，存量用户 `.harnessrc.json` 不会被覆盖（setup 不覆盖已有配置）
+- **已知局限（JSDoc 显式标注）**：`cd .. && echo hello > test.txt` 无法静态检测——cd 改变进程 CWD，字符串层面无法判定最终落点。这是 shell 灵活性的固有限制
+
+**测试结果：** 全量 457 测试零回归，`npx tsc --noEmit` 零错误。
+
+**E2E 验证：**
+- `harness run "echo hello > /etc/hosts"` → 范围围栏直接硬拒绝（无弹窗）
+- `harness run "echo hello > ../test.txt"` → 护栏规则先匹配弹 HITL → 拒绝后 agent 不再尝试
+
+Commit Hash: `798c03b`
