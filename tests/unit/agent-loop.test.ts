@@ -838,8 +838,9 @@ describe('AgentLoop', () => {
         autoFix: true,
         maxRetries: 3,
         checks: [
-          // 使用 bash -c 确保在 Windows 上也能产生英文 "command not found" 错误
-          { name: 'nonexistent', command: 'bash -c "nonexistent-tool-xyz-12345"', signalPattern: 'error' },
+          // 用 node 子进程退出码 127 模拟"工具不可用"（bash 的 command not found 标准信号），
+          // 避免依赖 bash 是否在 PATH 上，保证跨平台/跨语言稳定
+          { name: 'nonexistent', command: 'node -e "process.exit(127)"', signalPattern: 'error' },
         ],
       },
     });
@@ -1076,7 +1077,8 @@ describe('AgentLoop', () => {
         autoFix: true,
         maxRetries: 3,
         checks: [
-          { name: 'missing-tool', command: 'bash -c "command-not-found-xyz"', signalPattern: 'error' },
+          // 退出码 127 是 POSIX shell "command not found" 的标准信号，跨平台稳定
+          { name: 'missing-tool', command: 'node -e "process.exit(127)"', signalPattern: 'error' },
         ],
       },
     });

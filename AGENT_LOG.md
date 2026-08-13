@@ -93,7 +93,7 @@ Commit Hash:
 - [x] Task 13: CLI 入口
 - [x] Task 14: WebUI（⛔ 已弃用——项目定位单机 CLI，WebUI 审批无场景）
 - [ ] Task 15: 集成测试 + Docker + README
-- [ ] Task 16: 交互式多轮对话（chat 模式）
+- [x] Task 16: 交互式多轮对话（chat 模式）
 
 ---
 
@@ -609,4 +609,30 @@ Commit Hash: `798c03b`
 **后续路线：** Task 16（chat）→ Task 15（README 最后写，覆盖完整功能集）。
 
 Commit Hash: `16b7baf`
+
+---
+
+### 📋 Task 16 完成
+
+时间：2026-08-13  
+Task：Task 16 - 交互式多轮对话（chat 模式）  
+分支：`task/16-interactive-chat`  
+做了什么：TDD 实现 `AgentLoop.continue()` + `getMessages()` + `harness chat` 子命令，10 个新测试 + 全量 467 测试通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `AgentLoop` 重构：`messages` 从 `run()` 局部变量提升为实例属性，抽取公共私有方法 `runLoop(maxRounds)`，`run()` 与 `continue()` 共用，避免复制粘贴导致行为分歧
+- `continue(task)` — 复用已有消息历史（system prompt + assistant 回复 + 工具结果 + 反馈），仅追加 user 消息，**不重复 push system prompt**；空历史时防御性补一条 system prompt
+- `getMessages()` — 返回深拷贝只读副本（逐层克隆消息对象 / `toolCalls` / `arguments`），防止调用方修改返回值污染内部状态
+- `AgentResult` 新增可选字段 `messages?: Message[]`
+- `harness chat` 子命令 + `for await` REPL 循环（首次 `run`、后续 `continue`、空行跳过、`exit`/`quit` 退出），抽取 `initAgentLoop()` / `printResult()` 复用 run 的初始化逻辑，`hitl.onRequest` 只注册一次
+- 删除 `agent-loop.ts` 中未使用的 `SignalExtractor` import（⑥a 的职责已被 ⑥b `FailureClassifier` 吞并）
+
+**测试覆盖（10 个）：** run 后 continue 复用历史 / continue 不重复 system prompt / 决策记忆跨轮持久 / getMessages 只读副本（含 toolCalls.arguments 深拷贝）/ AgentResult.messages 字段 + run 每次重置 / continue 先于 run 调用 / 空字符串任务 / 多次 continue 状态累积 / run 出错后 continue 恢复 / continue 的 LLM 调用看到完整累计历史
+
+**⚠️ 与 PLAN 的偏差说明：**
+- PLAN 的 Files 列表写「修改 `src/core/types.ts`（AgentResult 扩展）」，但实际 `AgentResult` 接口定义在 `src/core/agent-loop.ts` 而非 `types.ts`，故 `messages?` 字段加在 `agent-loop.ts`，`types.ts` 无需改动
+
+**向后兼容：** `run()` 语义不变（每次重置历史），29 个存量 agent-loop 测试零回归。
+
+Commit Hash: `b4b1cfe`
 
