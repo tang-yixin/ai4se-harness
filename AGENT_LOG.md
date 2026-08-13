@@ -592,3 +592,21 @@ Commit Hash: `966719f`
 - `harness run "echo hello > ../test.txt"` → 护栏规则先匹配弹 HITL → 拒绝后 agent 不再尝试
 
 Commit Hash: `798c03b`
+
+---
+
+### 📝 规划调整：弃用 WebUI + 新增 chat 模式 Task
+
+时间：2026-08-13  
+审核问题：Task 14（WebUI）定位为 Express + SSE 的 HITL 审批 Web 接口，但项目是单机 CLI 工具，CLI TTY 弹窗已覆盖审批场景，WebUI 无实际用途。
+
+**改动（文档 + 配置）：**
+- `SPEC.md` — 6 处 WebUI 引用标记弃用（HITL 审批通道 / 组件图 / 依赖表 / 源码结构 / 技术选型 / 验收标准）
+- `PLAN.md` — Task 14 标记 ⛔ 弃用；依赖图改为 Task 13 → 并行 Task 15 / Task 16；新增 Task 16（交互式多轮对话 chat 模式）完整 6 步 TDD 计划
+- `AGENT_LOG.md` — checklist 同步（Task 14 弃用 + Task 16 新增）
+- `package.json` — 移除无用的 `express` / `@types/express` devDependencies
+
+**后续路线：** Task 16（chat）→ Task 15（README 最后写，覆盖完整功能集）。
+
+Commit Hash: `16b7baf`
+

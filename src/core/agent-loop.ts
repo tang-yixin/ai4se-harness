@@ -25,7 +25,6 @@ import { GuardrailEngine } from '../guardrails/engine.js';
 import { HITLStateMachine } from '../guardrails/hitl.js';
 import { ScopeFenceGuard } from '../guardrails/scope-fence.js';
 import { DecisionFingerprint } from '../guardrails/fingerprint.js';
-import { SignalExtractor } from '../feedback/extractor.js';
 import { FailureClassifier } from '../feedback/classifier.js';
 import { FeedbackFormatter } from '../feedback/formatter.js';
 import { GuardrailViolation } from '../tools/blacklist.js';
@@ -49,6 +48,8 @@ export interface AgentResult {
   rounds: number;
   summary: string;
   phase: AgentPhase;
+  /** 最终消息历史（只读副本，供 chat 模式复用） */
+  messages?: Message[];
 }
 
 // ============================================================
@@ -65,6 +66,8 @@ export class AgentLoop {
   readonly hitl: HITLStateMachine;
   /** 范围围栏，公开供测试验证 */
   readonly scopeFence: ScopeFenceGuard;
+  /** 会话消息历史：run() 会重置，continue() 在其上追加 */
+  private messages: Message[] = [];
 
   constructor(config: AgentLoopConfig) {
     this.llm = config.llm;
@@ -77,32 +80,87 @@ export class AgentLoop {
   }
 
   // ============================================================
-  // 公共方法：run()
+  // 公共方法：run() / continue() / getMessages()
   // ============================================================
 
   /**
-   * 执行 Agent 主循环。
+   * 执行 Agent 主循环（单次独立任务）。
+   *
+   * 每次调用会重置会话消息历史，重新构建 system prompt。
    *
    * @param task      用户任务描述（自然语言字符串）
    * @param maxRounds 最大循环轮数（默认 50）
    * @returns 任务完成状态 + 摘要
    */
   async run(task: string, maxRounds: number = 50): Promise<AgentResult> {
-    // ---- 初始化消息数组 ----
-    const messages: Message[] = [];
+    // ---- 重置消息历史（每次 run 是独立任务） ----
+    this.messages = [];
 
     // ① 上下文组装：system prompt（含记忆摘要）
-    messages.push({
+    this.messages.push({
       role: 'system',
       content: this.buildSystemPrompt(),
     });
 
     // 用户任务
-    messages.push({
+    this.messages.push({
       role: 'user',
       content: task,
     });
 
+    return this.runLoop(maxRounds);
+  }
+
+  /**
+   * 在已有会话历史上追加一条用户消息并继续主循环（多轮对话）。
+   *
+   * 与 run() 的区别：不重置消息历史、不重建 system prompt，而是复用
+   * 之前累积的 system prompt、assistant 回复、工具结果与反馈。
+   *
+   * @param task      用户追加的对话内容
+   * @param maxRounds 本次继续的最大循环轮数（默认 50）
+   * @returns 本次继续的任务完成状态 + 摘要
+   */
+  async continue(task: string, maxRounds: number = 50): Promise<AgentResult> {
+    // 防御性：若尚未初始化（从未 run 过），先补 system prompt
+    if (this.messages.length === 0) {
+      this.messages.push({
+        role: 'system',
+        content: this.buildSystemPrompt(),
+      });
+    }
+
+    // 追加用户消息（绝不重复 push system prompt）
+    this.messages.push({
+      role: 'user',
+      content: task,
+    });
+
+    return this.runLoop(maxRounds);
+  }
+
+  /**
+   * 返回当前会话消息历史的只读副本。
+   *
+   * 深拷贝每一层（消息对象、toolCalls、arguments），
+   * 防止调用方修改返回值而污染内部状态。
+   */
+  getMessages(): Message[] {
+    return this.messages.map((m) => this.cloneMessage(m));
+  }
+
+  // ============================================================
+  // 主循环（run() 与 continue() 共用，避免逻辑复制导致行为分歧）
+  // ============================================================
+
+  /**
+   * 执行主循环体：LLM 调用 → 解析 → 护栏 → 工具执行 → 反馈 → 停机判断。
+   *
+   * @param maxRounds 最大循环轮数
+   * @returns 任务完成状态 + 摘要 + 消息历史
+   */
+  private async runLoop(maxRounds: number): Promise<AgentResult> {
+    const messages = this.messages;
     let round = 0;
     let phase: AgentPhase = 'running';
 
@@ -172,6 +230,7 @@ export class AgentLoop {
       rounds: round,
       summary: this.buildSummary(messages, phase, round),
       phase,
+      messages: this.getMessages(),
     };
   }
 
@@ -625,5 +684,51 @@ Instructions:
     }
 
     return `Agent finished after ${round} rounds. Phase: ${phase}.`;
+  }
+
+  /**
+   * 深拷贝单条消息，供 getMessages() 返回只读副本。
+   *
+   * 独立克隆 toolCalls 数组及每个 toolCall 的 arguments 对象，
+   * 防止调用方修改返回值时污染内部会话状态。
+   */
+  private cloneMessage(message: Message): Message {
+    const clone: Message = {
+      role: message.role,
+      content: message.content,
+    };
+
+    if (message.toolCallId !== undefined) {
+      clone.toolCallId = message.toolCallId;
+    }
+    if (message.name !== undefined) {
+      clone.name = message.name;
+    }
+    if (message.toolCalls !== undefined) {
+      clone.toolCalls = message.toolCalls.map((tc) => ({
+        id: tc.id,
+        name: tc.name,
+        arguments: this.cloneValue(tc.arguments) as Record<string, unknown>,
+      }));
+    }
+
+    return clone;
+  }
+
+  /**
+   * 递归深拷贝任意 JSON 兼容值（用于克隆 toolCall.arguments）。
+   */
+  private cloneValue(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((v) => this.cloneValue(v));
+    }
+    if (value !== null && typeof value === 'object') {
+      const result: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(value)) {
+        result[key] = this.cloneValue(val);
+      }
+      return result;
+    }
+    return value;
   }
 }
