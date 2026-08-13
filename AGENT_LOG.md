@@ -677,3 +677,36 @@ Commit Hash: `04aa43f`
 
 Commit Hash: `ff25f20`
 
+---
+
+### 🔀 跨 Task 工作：上下文预算管理 + 输出长度处理（Task 0 + 2 + 9 + 12 + 13）
+
+时间：2026-08-13  
+涉及分支：`task/16-interactive-chat`  
+审核问题：AgentLoop 把 `messages` 数组当作「只增不减」的完整上下文，每轮全量发给 DeepSeek，没有任何预算/压缩/裁剪；`memory` 配置里的 `summaryInterval`/`contextThreshold` 和 `shouldSummarize()` 是「写了没接线」（生产代码零调用）。一旦累计 token 超过模型窗口，API 报错 → `error` 退出，前面所有轮白跑。此外 `finish_reason='length'`（输出被 max_tokens 截断）在主循环里无专门处理，会掉进「无 toolCalls → continue」分支空转。
+
+**方案：** 不引入 LLM 摘要（保持治理层确定性），用「确定性滑动窗口压缩 + 工具输出截断」实现输入上下文预算；输出侧把 `max_tokens` 默认值抬高并正确处理 `length`。TDD 全程红→绿。
+
+**改动范围（8 个文件，跨 5 个模块）：**
+
+| 文件 | 所属模块 | 改动 |
+|------|---------|------|
+| `src/memory/context.ts` | 记忆管理 (Task 9，新增) | 三个纯函数：`estimateTokens`（1 token≈4 字符估算，含 tool_calls 开销）、`truncateText`（超限截断 + `[TRUNCATED N chars]` 标记）、`compressContext`（滑动窗口压缩：保留 system + 首 user + 最近 N 条，整块丢弃中间并插入 `[context truncated]` 标记，绝不拆 assistant tool_calls ↔ tool 结果配对） |
+| `src/core/agent-loop.ts` | Agent 主循环 (Task 12) | ① `runLoop` 每轮 `llm.complete` 前做预算检查（`estimated / contextWindowTokens >= contextThreshold` 触发压缩，压缩后同步 `this.messages`）② `executeTool` 推入上下文前对 stdout/stderr 截断（原始 execResult 仍用于失败分类）③ `finish_reason='length'` 且无 toolCalls 时注入继续反馈而非空转 |
+| `src/core/types.ts` | 核心类型 (Task 0) | `HarnessConfig.memory` 新增 `contextWindowTokens` / `keepRecentMessages` / `maxToolResultChars` 三字段 |
+| `src/config/loader.ts` | 配置加载器 (Task 2) | `DEFAULTS` 增加三字段默认值（64000 / 8 / 8000）+ `llm.maxTokens` 默认 4096→8192 + `validateNumericFields` 增加三字段校验 |
+| `src/cli/index.ts` | CLI 入口 (Task 13) | `buildDefaultConfigTemplate()` 同步三字段与 maxTokens |
+| `tests/unit/context.test.ts` | 测试（新增） | 11 个：estimateTokens / truncateText / compressContext（前缀后缀保留、配对不拆、无孤儿 tool 结果、不修改输入、多次压缩） |
+| `tests/unit/config.test.ts` | 测试 | +5 个新字段校验与默认值断言（含非法值 0 / 负数） |
+| `tests/unit/agent-loop.test.ts` | 测试 | +3 个：length 注入继续反馈 / 超长工具输出截断 / 极小窗口触发压缩 |
+
+**⚠️ 影响面说明：**
+- 新增配置字段**向后兼容**——`deepMerge` 会给旧 `.harnessrc.json` 自动补默认值，不破坏存量配置
+- 小任务零行为变化（不触发压缩、工具输出不超 8KB 上限）；大任务 / 长 chat 从「崩溃」变「优雅降级」
+- `contextWindowTokens` 默认 64000 是**保守值**，代码里没有 `deepseek-v4-flash` 官方窗口数字，需按模型卡核实后回填
+- **与设计稿的偏差**：设计稿写「复活 `shouldSummarize()`」，实现改为直接做 token 阈值判断——`shouldSummarize` 带「每 N 轮触发」逻辑，若照用会在上下文远未超限时提前压缩、白白丢历史。`shouldSummarize` 保留未删（有测试、仍是可复用工具）
+
+**测试结果：** 全量 **492** 测试零回归（原 473 + 新增 19），`npx tsc --noEmit` 零错误，`npm run build` 成功。
+
+Commit Hash: `24bafef`
+
