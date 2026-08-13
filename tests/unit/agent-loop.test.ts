@@ -5,7 +5,7 @@ import { ToolRegistry } from '../../src/tools/registry.js';
 import { registerAllTools } from '../../src/tools/builtin/index.js';
 import { MemoryStore } from '../../src/memory/store.js';
 import { ConfigLoader } from '../../src/config/loader.js';
-import type { HarnessConfig, LLMResponse } from '../../src/core/types.js';
+import type { HarnessConfig, LLMResponse, Tool, Message } from '../../src/core/types.js';
 
 // ============================================================
 // 测试辅助函数
@@ -63,6 +63,21 @@ function stopResp(content: string): LLMResponse {
     finishReason: 'stop',
     usage: { promptTokens: 100, completionTokens: 30 },
   };
+}
+
+/** 检测是否存在「孤儿 tool 结果」：tool 消息前没有带 toolCalls 的 assistant */
+function hasOrphanToolResult(msgs: Message[]): boolean {
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role !== 'tool') continue;
+    let j = i - 1;
+    while (j >= 0 && msgs[j].role === 'tool') j--;
+    if (j < 0) return true;
+    const prev = msgs[j];
+    if (prev.role !== 'assistant' || !prev.toolCalls || prev.toolCalls.length === 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ============================================================
@@ -236,28 +251,21 @@ describe('AgentLoop', () => {
 
   // ---- HITL submit 后 timeout 自动拒绝 ----
   it('auto-denies HITL request on timeout in automated mode', async () => {
-    // 使用 confirm 规则 + 0 秒超时（立即超时）
+    // 用不越界的高风险命令（sudo）触发 HITL confirm，验证无人值守下自动拒绝
     const config = makeConfig({
       guardrails: {
         rules: [
-          { tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' },
+          { tool: 'execute_shell', pattern: 'sudo.*', action: 'confirm' },
         ],
         hitlTimeoutSeconds: 0, // 立即超时
       },
     });
 
     const mockLLM = new MockLLMProvider([
-      // 第一轮：尝试写入工作区外的文件（触发 confirm → HITL → timeout）
-      {
-        content: null,
-        toolCalls: [
-          { id: '1', name: 'write_file', arguments: { path: '../outside/file.ts', content: 'test' } },
-        ],
-        finishReason: 'tool_calls',
-        usage: { promptTokens: 30, completionTokens: 10 },
-      },
-      // 第二轮：收到 HITL 超时反馈后结束
-      stopResp('The write operation was not approved. Task stopped.'),
+      // 第一轮：执行高风险 sudo 命令（触发 confirm → HITL → 无人值守拒绝）
+      toolCallResp('execute_shell', { command: 'sudo systemctl restart nginx' }, '1'),
+      // 第二轮：收到 HITL 拒绝反馈后结束
+      stopResp('The sudo command was not approved. Task stopped.'),
     ]);
 
     const registry = new ToolRegistry();
@@ -270,17 +278,12 @@ describe('AgentLoop', () => {
       memory: new MemoryStore(memoryConfig),
     });
 
-    const result = await loop.run('Write file outside workspace');
+    const result = await loop.run('Run a sudo command');
 
     // 验证跑了两轮
     expect(result.rounds).toBe(2);
 
-    // 第一轮中不应该实际执行 write_file（HITL timeout 应该阻止）
-    const round1Messages = mockLLM.history[0].messages;
-    // 应该包含 HITL timeout 相关的消息
-    // verify: no actual file write happened (the tool was blocked by HITL)
-
-    // 第二轮消息中应该有超时/被拒绝的提示
+    // 第二轮消息中应该有 HITL 拒绝的提示
     const round2Messages = mockLLM.history[1].messages;
     const hitlMsg = round2Messages.find(
       (m) =>
@@ -654,23 +657,17 @@ describe('AgentLoop', () => {
   // P0-2: HITL APPROVED（外部审批通过）路径
   // ============================================================
   it('executes tool when HITL is externally approved', async () => {
+    // 用不越界的高风险命令（sudo）触发 HITL confirm，验证 approve 后工具被执行
     const config = makeConfig({
       guardrails: {
-        rules: [{ tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' }],
+        rules: [{ tool: 'execute_shell', pattern: 'sudo.*', action: 'confirm' }],
         hitlTimeoutSeconds: 60,
       },
     });
 
     const mockLLM = new MockLLMProvider([
-      {
-        content: null,
-        toolCalls: [
-          { id: '1', name: 'write_file', arguments: { path: '../outside/file.ts', content: 'test' } },
-        ],
-        finishReason: 'tool_calls',
-        usage: { promptTokens: 30, completionTokens: 10 },
-      },
-      stopResp('File written successfully (HITL approved).'),
+      toolCallResp('execute_shell', { command: 'sudo echo hi' }, '1'),
+      stopResp('The sudo command was executed (HITL approved).'),
     ]);
 
     const registry = new ToolRegistry();
@@ -688,11 +685,18 @@ describe('AgentLoop', () => {
       loop.hitl.approve(req.id);
     };
 
-    const result = await loop.run('Write file outside workspace');
+    const result = await loop.run('Run a sudo command');
 
     // HITL 被外部 approve → 工具应被执行
     expect(result.rounds).toBe(2);
     expect(result.success).toBe(true);
+
+    // 确认 execute_shell 被真正执行（而非 SCOPE FENCE BLOCK 或 HITL denied）
+    const round2Messages = mockLLM.history[1].messages;
+    const executed = round2Messages.find(
+      (m) => m.role === 'tool' && m.content.includes('"toolName":"execute_shell"'),
+    );
+    expect(executed).toBeDefined();
   });
 
   // ============================================================
@@ -830,6 +834,92 @@ describe('AgentLoop', () => {
   });
 
   // ============================================================
+  // P1-5b: 范围围栏硬拒绝优先于 confirm 规则
+  // ============================================================
+  it('blocks execute_shell redirect outside workspace even when confirm rule matches', async () => {
+    // 同时命中 confirm 规则（> \s*\.\.\/ → confirm）与范围围栏硬拒绝：
+    // 范围围栏必须优先，直接 SCOPE FENCE BLOCK，不弹 HITL
+    const config = makeConfig({
+      guardrails: {
+        rules: [
+          { tool: 'execute_shell', pattern: '>\\s*\\.\\.\\/', action: 'confirm' },
+        ],
+        hitlTimeoutSeconds: 60,
+      },
+    });
+
+    const mockLLM = new MockLLMProvider([
+      toolCallResp('execute_shell', { command: "echo 'hello' > ../test.txt" }, '1'),
+      stopResp('The redirect was blocked by scope fence.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    await loop.run('Write outside workspace via shell redirect');
+
+    const round2Messages = mockLLM.history[1].messages;
+    const fenceMsg = round2Messages.find(
+      (m) => m.role === 'tool' && m.content.includes('SCOPE FENCE BLOCK'),
+    );
+    expect(fenceMsg).toBeDefined();
+
+    // 不应走 HITL 审批路径
+    const hitlMsg = round2Messages.find(
+      (m) =>
+        m.role === 'tool' &&
+        (m.content.includes('HITL') || m.content.includes('timeout')),
+    );
+    expect(hitlMsg).toBeUndefined();
+  });
+
+  it('blocks write_file outside workspace even when confirm rule matches', async () => {
+    const config = makeConfig({
+      guardrails: {
+        rules: [{ tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' }],
+        hitlTimeoutSeconds: 60,
+      },
+    });
+
+    const mockLLM = new MockLLMProvider([
+      toolCallResp('write_file', { path: '../outside/file.ts', content: 'test' }, '1'),
+      stopResp('The write was blocked by scope fence.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    await loop.run('Write outside workspace');
+
+    const round2Messages = mockLLM.history[1].messages;
+    const fenceMsg = round2Messages.find(
+      (m) => m.role === 'tool' && m.content.includes('SCOPE FENCE BLOCK'),
+    );
+    expect(fenceMsg).toBeDefined();
+
+    const hitlMsg = round2Messages.find(
+      (m) =>
+        m.role === 'tool' &&
+        (m.content.includes('HITL') || m.content.includes('timeout')),
+    );
+    expect(hitlMsg).toBeUndefined();
+  });
+
+  // ============================================================
   // P1-6: runAutoChecks 工具不可用时跳过（不报 FAIL）
   // ============================================================
   it('skips auto checks gracefully when tool is not available', async () => {
@@ -838,8 +928,9 @@ describe('AgentLoop', () => {
         autoFix: true,
         maxRetries: 3,
         checks: [
-          // 使用 bash -c 确保在 Windows 上也能产生英文 "command not found" 错误
-          { name: 'nonexistent', command: 'bash -c "nonexistent-tool-xyz-12345"', signalPattern: 'error' },
+          // 用 node 子进程退出码 127 模拟"工具不可用"（bash 的 command not found 标准信号），
+          // 避免依赖 bash 是否在 PATH 上，保证跨平台/跨语言稳定
+          { name: 'nonexistent', command: 'node -e "process.exit(127)"', signalPattern: 'error' },
         ],
       },
     });
@@ -1076,7 +1167,8 @@ describe('AgentLoop', () => {
         autoFix: true,
         maxRetries: 3,
         checks: [
-          { name: 'missing-tool', command: 'bash -c "command-not-found-xyz"', signalPattern: 'error' },
+          // 退出码 127 是 POSIX shell "command not found" 的标准信号，跨平台稳定
+          { name: 'missing-tool', command: 'node -e "process.exit(127)"', signalPattern: 'error' },
         ],
       },
     });
@@ -1166,5 +1258,148 @@ describe('AgentLoop', () => {
     const decisions = memory.getAllDecisions();
     // search_code 不自动记录决策（只有 deny/confirm 才记录），这里验证不崩溃
     expect(decisions.length).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ============================================================
+// 上下文预算管理与输出长度处理
+// ============================================================
+
+describe('AgentLoop — 上下文预算与输出长度', () => {
+  /** 返回超大 stdout 的自定义工具，用于截断测试（零子进程、纯确定性） */
+  function hugeTool(): Tool {
+    return {
+      name: 'huge_output',
+      description: 'Returns a huge stdout for truncation testing.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      riskHint: 'low',
+      async execute() {
+        return {
+          toolName: 'huge_output',
+          success: true,
+          stdout: 'x'.repeat(30000),
+          stderr: '',
+          exitCode: 0,
+        };
+      },
+    };
+  }
+
+  // ---- finish_reason = length ----
+  it('injects continue-feedback and continues on finish_reason length', async () => {
+    const mockLLM = new MockLLMProvider([
+      {
+        content: 'part of a long answer that got cut off',
+        toolCalls: [],
+        finishReason: 'length',
+        usage: { promptTokens: 30, completionTokens: 4096 },
+      },
+      stopResp('... the rest of the answer. Done.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config: noChecksConfig,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    const result = await loop.run('Write a long answer');
+    expect(result.rounds).toBe(2);
+    expect(result.success).toBe(true);
+
+    // 第二轮消息中应包含「输出被截断」的继续反馈
+    const round2Messages = mockLLM.history[1].messages;
+    const feedback = round2Messages.find(
+      (m) =>
+        m.role === 'system' &&
+        m.content.includes('truncated') &&
+        m.content.includes('max_tokens'),
+    );
+    expect(feedback).toBeDefined();
+  });
+
+  // ---- 工具输出截断 ----
+  it('truncates oversized tool result when pushing to context', async () => {
+    const mockLLM = new MockLLMProvider([
+      {
+        content: null,
+        toolCalls: [{ id: '1', name: 'huge_output', arguments: {} }],
+        finishReason: 'tool_calls',
+        usage: { promptTokens: 10, completionTokens: 5 },
+      },
+      stopResp('Done.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registry.register(hugeTool());
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config: noChecksConfig,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    await loop.run('Get huge output');
+
+    // 第二轮 LLM 看到的 tool 消息应被截断（30000 字符 → 8000 + 标记）
+    const round2Messages = mockLLM.history[1].messages;
+    const toolMsg = round2Messages.find((m) => m.role === 'tool');
+    expect(toolMsg).toBeDefined();
+    expect(toolMsg!.content).toContain('TRUNCATED');
+    expect(toolMsg!.content.length).toBeLessThan(15000);
+  });
+
+  // ---- 上下文压缩触发 ----
+  it('compresses context when token estimate exceeds window threshold', async () => {
+    const config = makeConfig({
+      memory: {
+        contextWindowTokens: 40, // 极小窗口，阈值 ≈ 32 token
+        keepRecentMessages: 4,
+      },
+    });
+
+    // 多轮 tool_call，让 messages 累积到超过阈值
+    const responses: LLMResponse[] = [];
+    for (let i = 0; i < 6; i++) {
+      responses.push({
+        content: null,
+        toolCalls: [{ id: String(i), name: 'list_directory', arguments: { path: '.' } }],
+        finishReason: 'tool_calls',
+        usage: { promptTokens: 50, completionTokens: 20 },
+      });
+    }
+    responses.push(stopResp('Done.'));
+
+    const mockLLM = new MockLLMProvider(responses);
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    const result = await loop.run('Do many rounds');
+    expect(result.success).toBe(true);
+
+    // 某一次 LLM 调用收到的 messages 中应包含 [context truncated] 标记
+    const anyTruncated = mockLLM.history.some((call) =>
+      call.messages.some(
+        (m) => m.role === 'system' && m.content.includes('context truncated'),
+      ),
+    );
+    expect(anyTruncated).toBe(true);
+
+    // 且每次调用都不产生孤儿 tool 结果（配对不变量）
+    for (const call of mockLLM.history) {
+      expect(hasOrphanToolResult(call.messages)).toBe(false);
+    }
   });
 });

@@ -19,7 +19,7 @@ import { Command } from 'commander';
 import { existsSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { createInterface } from 'readline';
+import { createInterface, type Interface } from 'readline';
 import { stdin, stdout, env, argv, exit } from 'process';
 import { ConfigLoader } from '../config/loader.js';
 import { CredentialStore } from '../credentials/store.js';
@@ -27,6 +27,7 @@ import { MemoryStore } from '../memory/store.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { registerAllTools } from '../tools/builtin/index.js';
 import { AgentLoop } from '../core/agent-loop.js';
+import type { AgentResult } from '../core/agent-loop.js';
 import { DeepSeekProvider } from '../llm/deepseek.js';
 
 // ============================================================
@@ -67,74 +68,49 @@ export function createProgram(): Command {
     .option('-c, --config <path>', 'Config file path', DEFAULT_CONFIG_PATH)
     .action(async (task: string, options: { config: string }) => {
       try {
-        // 加载配置（校验失败会直接抛出 ConfigError）
-        const config = ConfigLoader.load(options.config);
+        // 初始化各模块（配置加载、API key 解析、工具注册）
+        const loop = await initAgentLoop(options.config);
 
-        // 获取 API key（先查环境变量，再交互式解密凭据文件）
-        const apiKey = await resolveApiKey();
-        if (apiKey === null) {
-          console.error(
-            'No API key configured.\n'
-            + 'Options:\n'
-            + '  1. Run "harness setup" to configure interactively\n'
-            + '  2. Set DEEPSEEK_API_KEY environment variable',
-          );
-          exit(1);
-        }
-
-        // 初始化各模块
-        const llm = new DeepSeekProvider({
-          apiKey,
-          model: config.llm.model,
-          baseURL: config.llm.baseURL,
-          maxTokens: config.llm.maxTokens,
-        });
-
-        const tools = new ToolRegistry();
-        registerAllTools(tools);
-
-        const memory = new MemoryStore(config.memory);
-
-        // 运行 Agent 主循环
-        const loop = new AgentLoop({ llm, tools, config, memory });
-
-        // 注册交互式 HITL 审批回调 —— 当护栏引擎标记 confirm 时弹出终端提示
+        // 交互式 HITL 审批（仅在 TTY 下注册，run 模式用独立 promptLine）
         if (stdin.isTTY) {
-          loop.hitl.onRequest = async (req) => {
-            // 预留一行空行让输出更可读
-            console.log(
-              `\n⚠️  Dangerous operation detected:\n`
-              + `   Tool   : ${req.toolName}\n`
-              + `   Reason : ${req.reason}\n`
-              + `   Params : ${JSON.stringify(req.params)}`,
-            );
-
-            const answer = await promptLine('   (A)pprove / (D)eny? ');
-
-            if (answer.toLowerCase() === 'a' || answer.toLowerCase() === 'approve') {
-              loop.hitl.approve(req.id);
-              console.log('   → Approved\n');
-            } else {
-              loop.hitl.deny(req.id);
-              console.log('   → Denied\n');
-            }
-          };
+          registerHitlPrompt(loop, promptLine);
         }
 
         console.log(`Starting agent for task: "${task}"\n`);
 
         const result = await loop.run(task);
+        printResult(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Error: ${message}`);
+        exit(1);
+      }
+    });
 
-        // 输出结果摘要
-        console.log('\n─────────────────────────────────────');
-        if (result.success) {
-          console.log(result.summary);
-        } else {
-          console.log(result.summary);
-        }
-        console.log(
-          `Rounds: ${result.rounds} | Phase: ${result.phase}`,
-        );
+  // ==========================================================
+  // harness chat
+  // ==========================================================
+  program
+    .command('chat')
+    .description('Interactive multi-turn chat with the agent')
+    .option('-c, --config <path>', 'Config file path', DEFAULT_CONFIG_PATH)
+    .action(async (options: { config: string }) => {
+      try {
+        // 复用同一 AgentLoop 实例，保证 MemoryStore（决策记忆）跨轮持久
+        const loop = await initAgentLoop(options.config);
+
+        console.log('AI4SE Harness — interactive chat mode.');
+        console.log('Type your message, or "exit" / "quit" to leave.\n');
+
+        // 单一 readline 接口：chat REPL 与 HITL 审批共用，避免竞争接口
+        // 导致输入串扰（多输入的字符泄漏到下一轮）与流状态损坏（异常退出）。
+        // 仅在 TTY 下提供交互式 HITL 审批；非 TTY（管道）保持无人值守自动拒绝。
+        const rl = createInterface({ input: stdin, output: stdout });
+        const ask = stdin.isTTY
+          ? (prompt: string): Promise<string> =>
+              new Promise<string>((resolve) => rl.question(prompt, (ans) => resolve(ans.trim())))
+          : undefined;
+        await runChatRepl(loop, rl, ask);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error(`Error: ${message}`);
@@ -282,6 +258,150 @@ export function createProgram(): Command {
 // ============================================================
 
 /**
+ * 初始化 AgentLoop：加载配置、解析 API key、注册工具与 HITL 审批回调。
+ *
+ * run 与 chat 两个命令共用此初始化逻辑，避免重复。
+ * hitl.onRequest 回调在返回前只注册一次，chat 模式的多轮循环不会重复注册。
+ *
+ * @param configPath 配置文件路径
+ * @returns 已初始化好的 AgentLoop 实例
+ */
+async function initAgentLoop(configPath: string): Promise<AgentLoop> {
+  // 加载配置（校验失败会直接抛出 ConfigError）
+  const config = ConfigLoader.load(configPath);
+
+  // 获取 API key（先查环境变量，再交互式解密凭据文件）
+  const apiKey = await resolveApiKey();
+  if (apiKey === null) {
+    console.error(
+      'No API key configured.\n'
+      + 'Options:\n'
+      + '  1. Run "harness setup" to configure interactively\n'
+      + '  2. Set DEEPSEEK_API_KEY environment variable',
+    );
+    exit(1);
+  }
+
+  // 初始化各模块
+  const llm = new DeepSeekProvider({
+    apiKey,
+    model: config.llm.model,
+    baseURL: config.llm.baseURL,
+    maxTokens: config.llm.maxTokens,
+  });
+
+  const tools = new ToolRegistry();
+  registerAllTools(tools);
+
+  const memory = new MemoryStore(config.memory);
+
+  const loop = new AgentLoop({ llm, tools, config, memory });
+
+  return loop;
+}
+
+/**
+ * 输出 Agent 运行结果摘要（run 与 chat 共用）。
+ */
+function printResult(result: AgentResult): void {
+  console.log('\n─────────────────────────────────────');
+  console.log(result.summary);
+  console.log(`Rounds: ${result.rounds} | Phase: ${result.phase}`);
+}
+
+/**
+ * 注册交互式 HITL 审批回调 —— 当护栏引擎标记 confirm 时弹出终端提示。
+ *
+ * `ask` 为注入的输入函数：run 模式用 promptLine（独立接口），
+ * chat 模式用共享 rl 的 question（与 REPL 同一接口，避免竞争）。
+ */
+function registerHitlPrompt(
+  loop: AgentLoop,
+  ask: (prompt: string) => Promise<string>,
+): void {
+  loop.hitl.onRequest = async (req) => {
+    console.log(
+      `\n⚠️  Dangerous operation detected:\n`
+      + `   Tool   : ${req.toolName}\n`
+      + `   Reason : ${req.reason}\n`
+      + `   Params : ${JSON.stringify(req.params)}`,
+    );
+
+    const answer = await ask('   (A)pprove / (D)eny? ');
+
+    if (answer.toLowerCase() === 'a' || answer.toLowerCase() === 'approve') {
+      loop.hitl.approve(req.id);
+      console.log('   → Approved\n');
+    } else {
+      loop.hitl.deny(req.id);
+      console.log('   → Denied\n');
+    }
+  };
+}
+
+/**
+ * 交互式多轮对话 REPL（chat 命令）。导出仅供测试（与 createProgram 同类），
+ * 非 CLI 公共 API。
+ *
+ * 复用同一个 readline 接口 `rl` 驱动聊天循环与 HITL 审批提示，
+ * 采用回调驱动的 question() 循环而非 for await，避免创建第二个 readline
+ * 接口与 REPL 竞争 stdin —— 那会带来输入串扰（多输入字符泄漏）与
+ * 流状态损坏（异常退出）。
+ *
+ * @param loop 已初始化的 AgentLoop 实例
+ * @param rl   共享的 readline 接口（input 指向 stdin）
+ * @param ask  可选的交互式 HITL 输入函数；未提供则保持无人值守（自动拒绝）
+ * @returns 当用户输入 exit/quit 时 resolve；运行出错时 reject，由调用方统一退出
+ */
+export function runChatRepl(
+  loop: AgentLoop,
+  rl: Interface,
+  ask?: (prompt: string) => Promise<string>,
+): Promise<void> {
+  if (ask) {
+    registerHitlPrompt(loop, ask);
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    let first = true;
+
+    const askNext = (): void => {
+      rl.question('harness> ', async (raw) => {
+        const input = raw.trim();
+
+        // 空行跳过
+        if (input.length === 0) {
+          askNext();
+          return;
+        }
+
+        // 退出指令
+        if (input === 'exit' || input === 'quit') {
+          rl.close();
+          console.log('Bye.');
+          resolve();
+          return;
+        }
+
+        try {
+          const result = first ? await loop.run(input) : await loop.continue(input);
+          first = false;
+          printResult(result);
+          askNext();
+        } catch (error) {
+          // 出错时关闭接口并向上抛，由 chat 命令的 catch 统一输出并退出
+          // （与 run 命令一致，避免在库函数内调用 process.exit）
+          rl.close();
+          reject(error);
+        }
+      });
+    };
+
+    askNext();
+  });
+}
+
+/**
  * 构建默认的 .harnessrc.json 配置模板字符串。
  *
  * 内容与 ConfigLoader.DEFAULTS 保持同步，输出为格式化的 JSON 字符串。
@@ -295,15 +415,12 @@ function buildDefaultConfigTemplate(): string {
       provider: 'deepseek',
       model: 'deepseek-chat',
       baseURL: 'https://api.deepseek.com/v1',
-      maxTokens: 4096,
+      maxTokens: 8192,
     },
     guardrails: {
       rules: [
         { tool: 'execute_shell', pattern: 'sudo.*', action: 'confirm' },
         { tool: 'execute_shell', pattern: '(curl|wget).*\\|.*(bash|sh)', action: 'deny' },
-        { tool: 'execute_shell', pattern: '>\\s*\\.\\.\\/', action: 'confirm' },
-        { tool: 'execute_shell', pattern: '>\\s*\\.\\.\\\\', action: 'confirm' },
-        { tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' },
         { tool: 'write_file', pattern: '^\\/(etc|var|tmp)\\/', action: 'confirm' },
       ],
       hitlTimeoutSeconds: 60,
@@ -317,6 +434,9 @@ function buildDefaultConfigTemplate(): string {
       maxTokens: 2000,
       summaryInterval: 10,
       contextThreshold: 0.8,
+      contextWindowTokens: 64000,
+      keepRecentMessages: 8,
+      maxToolResultChars: 8000,
     },
     feedback: {
       autoFix: true,

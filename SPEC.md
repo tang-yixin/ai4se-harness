@@ -94,7 +94,7 @@ Agent 主循环是 harness 的核心引擎，负责驱动"上下文组装 → LL
 **边界条件：**
 - 最大循环轮数可配置（默认 50 轮）
 - 单次 LLM 调用超时（默认 60 秒）
-- 上下文窗口接近上限时触发摘要压缩（阈值 80%）
+- 上下文窗口接近上限时触发上下文压缩（阈值 80%）
 
 **错误处理：**
 - LLM 调用失败（网络/限流/服务端错误）→ 最多重试 3 次，指数退避，全部失败则终止
@@ -231,17 +231,19 @@ IDLE → WAITING → APPROVED → 执行
 | 类型 | 存储内容 | 存储位置 | 检索方式 |
 |------|---------|----------|----------|
 | 会话记忆 | 当前会话的对话历史 | 内存数组 | 直接拼接进 context |
-| 项目记忆 | 项目约定、代码风格 | `.harness-memory.json` | 启动时加载（maxTokens 截断） |
-| 决策记忆 | 用户的历史审批决策 | `.harness-decisions.json` | 护栏查询（两级指纹匹配） |
+| 项目记忆 | 项目约定、代码风格 | 内存 Map（不落盘） | 注入 system prompt（maxTokens 截断） |
+| 决策记忆 | 用户的历史审批决策 | 内存数组（不落盘） | 护栏查询（两级指纹匹配） |
 
-**会话记忆压缩：** 双轨触发——每 10 轮自动触发 + token 估算超 80% 窗口强制触发。摘要由 harness 自己的 LLM 抽象层生成，不引入第二条调用路径。
+> **说明：** 项目记忆与决策记忆均为**进程内内存存储，不落盘**——进程退出即清空。持久化（`.harness-memory.json` / `.harness-decisions.json`）已明确不做，保持单机 CLI 的无状态定位（除凭据外不跨进程保留任何状态）。
+
+**会话记忆压缩：** token 估算超 `contextThreshold`（默认 80%）窗口时触发**确定性滑动窗口压缩**（不调 LLM）：保留 system prompt + 首个用户任务 + 最近 `keepRecentMessages` 条，整块丢弃中间历史并插入 `[context truncated]` 标记，绝不拆散 assistant tool_calls ↔ tool 结果配对。选择确定性截断而非 LLM 摘要，契合「确定性代码而非提示词」的核心原则（§1）：零额外 LLM 成本、纯函数可单测、结果确定。
 
 **决策指纹匹配：**
 - **精确匹配**：工具名 + 命令完全相同 → 复用历史决策，跳过 HITL
 - **模糊匹配**：工具名相同 + 命令相似度 > 阈值 → 仍走 HITL，但降一级（high→medium）
 - **无匹配**：走标准风险评估流程
 
-**项目记忆截断：** 加载 `.harness-memory.json` 时按 `maxTokens` 限制截断，优先保留最近条目，旧的只保留标题。
+**项目记忆截断：** 生成记忆摘要时按 `maxTokens` 限制截断，按 `updatedAt` 降序优先保留最近条目。
 
 ### 3.6 配置系统
 
@@ -254,7 +256,7 @@ IDLE → WAITING → APPROVED → 执行
     "provider": "deepseek",
     "model": "deepseek-chat",
     "baseURL": "https://api.deepseek.com/v1",
-    "maxTokens": 4096
+    "maxTokens": 8192
   },
   "guardrails": {
     "rules": [
@@ -273,7 +275,10 @@ IDLE → WAITING → APPROVED → 执行
   "memory": {
     "maxTokens": 2000,
     "summaryInterval": 10,
-    "contextThreshold": 0.8
+    "contextThreshold": 0.8,
+    "contextWindowTokens": 64000,
+    "keepRecentMessages": 8,
+    "maxToolResultChars": 8000
   },
   "feedback": {
     "autoFix": true,
@@ -301,7 +306,7 @@ IDLE → WAITING → APPROVED → 执行
 
 - 主循环单轮延迟（不含 LLM 网络调用）< 10ms
 - CLI 启动到可交互 < 500ms
-- 记忆文件读写 < 50ms（文件 < 100KB 时）
+- 记忆操作（读/写/摘要，千级条目）< 200ms（纯内存，无文件 I/O）
 
 ### 4.2 安全 —— 凭据威胁模型
 
@@ -423,7 +428,7 @@ ai4se-harness/
 │   │   └── fingerprint.ts     #   决策指纹匹配
 │   ├── memory/                # 记忆管理
 │   │   ├── store.ts           #   记忆读写 + maxTokens 截断
-│   │   └── summarizer.ts      #   摘要器（调 LLM）
+│   │   └── context.ts         #   上下文预算管理（确定性压缩）
 │   ├── feedback/              # 反馈闭环
 │   │   ├── extractor.ts       #   ⑥a 信号提取
 │   │   ├── classifier.ts      #   ⑥b 失败分类
@@ -710,7 +715,7 @@ docker run -it --rm -v $(pwd):/workspace ai4se-harness run "你的任务"
 |------|------|----------|
 | DeepSeek API 的 tool calling 行为与 OpenAI 有细微差异 | LLM 响应解析失败 | 在 `DeepSeekProvider` 中做响应格式归一化；保留原始响应用于调试 |
 | 护栏规则的正则表达式被 LLM 学会绕过 | 危险命令可能不被拦截 | 多层防御（硬黑名单 + 规则引擎 + 范围围栏），不依赖单一机制 |
-| 对话摘要质量不高导致 agent 丢失上下文 | agent 行为偏离任务目标 | 摘要 prompt 精心设计；保留最近 N 轮完整对话不被压缩 |
+| 上下文压缩丢弃中间历史导致 agent 丢失早期上下文 | agent 行为偏离任务目标 | 确定性滑动窗口：始终保留 system + 首用户任务 + 最近 N 条；整块丢弃而非逐条裁剪，避免拆散 tool 配对 |
 | `npm install -g` 在不同平台的行为不一致 | 用户安装失败 | Docker 方案兜底；README 写清晰的前提条件（Node.js ≥ 18） |
 | 主密码遗忘 | key 永久不可恢复 | README 安全边界说明中明确警告；建议用户自己备份 key |
 | TypeScript 7.x（刚安装的版本）可能存在不兼容 | 编译或运行错误 | 锁定 `package.json` 中的 `typescript` 版本；CI 中测试多个 TS 版本 |

@@ -93,7 +93,7 @@ Commit Hash:
 - [x] Task 13: CLI 入口
 - [x] Task 14: WebUI（⛔ 已弃用——项目定位单机 CLI，WebUI 审批无场景）
 - [ ] Task 15: 集成测试 + Docker + README
-- [ ] Task 16: 交互式多轮对话（chat 模式）
+- [x] Task 16: 交互式多轮对话（chat 模式）
 
 ---
 
@@ -592,3 +592,121 @@ Commit Hash: `966719f`
 - `harness run "echo hello > ../test.txt"` → 护栏规则先匹配弹 HITL → 拒绝后 agent 不再尝试
 
 Commit Hash: `798c03b`
+
+---
+
+### 📝 规划调整：弃用 WebUI + 新增 chat 模式 Task
+
+时间：2026-08-13  
+审核问题：Task 14（WebUI）定位为 Express + SSE 的 HITL 审批 Web 接口，但项目是单机 CLI 工具，CLI TTY 弹窗已覆盖审批场景，WebUI 无实际用途。
+
+**改动（文档 + 配置）：**
+- `SPEC.md` — 6 处 WebUI 引用标记弃用（HITL 审批通道 / 组件图 / 依赖表 / 源码结构 / 技术选型 / 验收标准）
+- `PLAN.md` — Task 14 标记 ⛔ 弃用；依赖图改为 Task 13 → 并行 Task 15 / Task 16；新增 Task 16（交互式多轮对话 chat 模式）完整 6 步 TDD 计划
+- `AGENT_LOG.md` — checklist 同步（Task 14 弃用 + Task 16 新增）
+- `package.json` — 移除无用的 `express` / `@types/express` devDependencies
+
+**后续路线：** Task 16（chat）→ Task 15（README 最后写，覆盖完整功能集）。
+
+Commit Hash: `16b7baf`
+
+---
+
+### 📋 Task 16 完成
+
+时间：2026-08-13  
+Task：Task 16 - 交互式多轮对话（chat 模式）  
+分支：`task/16-interactive-chat`  
+做了什么：TDD 实现 `AgentLoop.continue()` + `getMessages()` + `harness chat` 子命令，10 个新测试 + 全量 467 测试通过，`npx tsc --noEmit` 零错误。
+
+**实现要点：**
+- `AgentLoop` 重构：`messages` 从 `run()` 局部变量提升为实例属性，抽取公共私有方法 `runLoop(maxRounds)`，`run()` 与 `continue()` 共用，避免复制粘贴导致行为分歧
+- `continue(task)` — 复用已有消息历史（system prompt + assistant 回复 + 工具结果 + 反馈），仅追加 user 消息，**不重复 push system prompt**；空历史时防御性补一条 system prompt
+- `getMessages()` — 返回深拷贝只读副本（逐层克隆消息对象 / `toolCalls` / `arguments`），防止调用方修改返回值污染内部状态
+- `AgentResult` 新增可选字段 `messages?: Message[]`
+- `harness chat` 子命令 + `for await` REPL 循环（首次 `run`、后续 `continue`、空行跳过、`exit`/`quit` 退出），抽取 `initAgentLoop()` / `printResult()` 复用 run 的初始化逻辑，`hitl.onRequest` 只注册一次
+- 删除 `agent-loop.ts` 中未使用的 `SignalExtractor` import（⑥a 的职责已被 ⑥b `FailureClassifier` 吞并）
+
+**测试覆盖（10 个）：** run 后 continue 复用历史 / continue 不重复 system prompt / 决策记忆跨轮持久 / getMessages 只读副本（含 toolCalls.arguments 深拷贝）/ AgentResult.messages 字段 + run 每次重置 / continue 先于 run 调用 / 空字符串任务 / 多次 continue 状态累积 / run 出错后 continue 恢复 / continue 的 LLM 调用看到完整累计历史
+
+**⚠️ 与 PLAN 的偏差说明：**
+- PLAN 的 Files 列表写「修改 `src/core/types.ts`（AgentResult 扩展）」，但实际 `AgentResult` 接口定义在 `src/core/agent-loop.ts` 而非 `types.ts`，故 `messages?` 字段加在 `agent-loop.ts`，`types.ts` 无需改动
+
+**向后兼容：** `run()` 语义不变（每次重置历史），29 个存量 agent-loop 测试零回归。
+
+Commit Hash: `b4b1cfe`
+
+---
+
+### 🔧 跨 Task 修复：chat 模式 HITL 审批输入串扰与异常退出（Task 13 + 16）
+
+时间：2026-08-13  
+涉及分支：`task/16-interactive-chat`  
+审核问题：`harness chat` 中 HITL 审批弹窗输入多字符（如 `aa`）会泄漏成下一轮对话消息；且偶发异常退出（`harness>` 提示后进程直接返回 shell）。
+
+**根因：** chat REPL 与 HITL 审批各建一个 `readline.Interface` 共享同一个 `stdin`，两个接口竞争——输入被重复/拆分消费（多输入的字符残留进下一轮），第二个接口 `close()` 干扰 REPL 流状态使 `for await` 提前结束。
+
+**修复（`src/cli/index.ts`）：**
+- 抽取 `registerHitlPrompt(loop, ask)`；导出 `runChatRepl(loop, rl, ask?)`（导出仅供测试，非 CLI 公共 API）
+- chat 命令改用**单一 rl + 回调驱动的 `question()` 循环**（替代 `for await` + `promptLine` 每次新建接口），HITL 复用同一个 `rl`
+- 非 TTY 保持无人值守：`ask = stdin.isTTY ? ... : undefined`，`runChatRepl` 仅在 `ask` 存在时才注册 HITL → 自动拒绝
+- `runChatRepl` 出错时 `reject` 交由 chat action 统一 `exit(1)`，不再在库函数内 `process.exit`
+- `initAgentLoop` 移除 HITL 注册块，run/chat 各自注册（run 保留 TTY 守卫 + `promptLine`）
+
+**测试：** `tests/unit/chat-repl.test.ts` +4 个（`aa` 泄漏 / `a` 审批通过 / 空行 + quit / 无人值守自动拒绝），全量 **471** 测试零回归，`npx tsc --noEmit` 零错误。
+
+Commit Hash: `04aa43f`
+
+---
+
+### 🔧 跨 Task 修复：范围围栏硬拒绝失效（confirm 规则抢先拦截，Task 8 + 12 + 13）
+
+时间：2026-08-13  
+涉及分支：`task/16-interactive-chat`  
+审核问题：`echo -n 'hello world' > ../test.txt`、`write_file ../test.txt` 本应被第三层范围围栏硬拒绝（`SCOPE FENCE BLOCK`，不弹窗），却只触发 confirm 规则弹 HITL 审批——approve 直接执行、deny 后 agent 换 `write_file`/`sed -i` 继续绕过，越界写仍成功。
+
+**根因：** `processToolCall()` 里范围围栏硬拒绝（`validatePath` / `validateShellCommand`）排在 `confirm → HITL` 分支之后。`798c03b` 那次修复同时做了两件互相冲突的事：范围围栏加了 `validateShellCommand()`（硬拒绝 `> ../`），又在配置模板加了 `execute_shell > \s*\.\.\/ → confirm` 等 confirm 规则——两者抢同一件事，confirm 却排前面，把「硬拒绝」降级成「可审批 confirm」。`validateShellCommand()` 本身没坏，坏在调用顺序。
+
+**修复：**
+- **方案 1（`src/core/agent-loop.ts`）**：提取 `applyScopeFenceHardChecks()`（含 `write_file validatePath` + `execute_shell validateShellCommand`），提前到 deny 之后、confirm 之前——工作区边界是不可协商的硬约束，先于 HITL，HITL approve 不得绕过；`validateHost`（非白名单主机 → HITL）是软约束，留在原位。
+- **方案 2（`src/cli/index.ts` + `.harnessrc.json`）**：删 3 条与范围围栏重复的 confirm 规则（`execute_shell > ../`、`> ..\`、`write_file ../`），新顺序下它们已成死规则。
+
+**测试：** `tests/unit/agent-loop.test.ts` +2 个（execute_shell 重定向越界 / write_file 越界，同时命中 confirm 规则时断言走 `SCOPE FENCE BLOCK` 而非 HITL），改 2 个 HITL fixture（原用 `write_file ../outside` 触发 HITL，改用 `execute_shell sudo.*`），全量 **473** 测试零回归，`npx tsc --noEmit` 零错误。
+
+**已知局限（接受，不修复）：** `cp test.txt ../test.txt`、`sed -i`、`cd ..` 等不经过重定向符号的写命令仍可绕过——shell 表达力无限，字符串匹配永远堵不完（打地鼠）。彻底解决需 OS 级沙箱（容器 / 权限降级 / 文件系统 ACL），超出当前「确定性代码 + 字符串级护栏」的定位，可归入 Task 15 或不修复。
+
+Commit Hash: `ff25f20`
+
+---
+
+### 🔀 跨 Task 工作：上下文预算管理 + 输出长度处理（Task 0 + 2 + 9 + 12 + 13）
+
+时间：2026-08-13  
+涉及分支：`task/16-interactive-chat`  
+审核问题：AgentLoop 把 `messages` 数组当作「只增不减」的完整上下文，每轮全量发给 DeepSeek，没有任何预算/压缩/裁剪；`memory` 配置里的 `summaryInterval`/`contextThreshold` 和 `shouldSummarize()` 是「写了没接线」（生产代码零调用）。一旦累计 token 超过模型窗口，API 报错 → `error` 退出，前面所有轮白跑。此外 `finish_reason='length'`（输出被 max_tokens 截断）在主循环里无专门处理，会掉进「无 toolCalls → continue」分支空转。
+
+**方案：** 不引入 LLM 摘要（保持治理层确定性），用「确定性滑动窗口压缩 + 工具输出截断」实现输入上下文预算；输出侧把 `max_tokens` 默认值抬高并正确处理 `length`。TDD 全程红→绿。
+
+**改动范围（8 个文件，跨 5 个模块）：**
+
+| 文件 | 所属模块 | 改动 |
+|------|---------|------|
+| `src/memory/context.ts` | 记忆管理 (Task 9，新增) | 三个纯函数：`estimateTokens`（1 token≈4 字符估算，含 tool_calls 开销）、`truncateText`（超限截断 + `[TRUNCATED N chars]` 标记）、`compressContext`（滑动窗口压缩：保留 system + 首 user + 最近 N 条，整块丢弃中间并插入 `[context truncated]` 标记，绝不拆 assistant tool_calls ↔ tool 结果配对） |
+| `src/core/agent-loop.ts` | Agent 主循环 (Task 12) | ① `runLoop` 每轮 `llm.complete` 前做预算检查（`estimated / contextWindowTokens >= contextThreshold` 触发压缩，压缩后同步 `this.messages`）② `executeTool` 推入上下文前对 stdout/stderr 截断（原始 execResult 仍用于失败分类）③ `finish_reason='length'` 且无 toolCalls 时注入继续反馈而非空转 |
+| `src/core/types.ts` | 核心类型 (Task 0) | `HarnessConfig.memory` 新增 `contextWindowTokens` / `keepRecentMessages` / `maxToolResultChars` 三字段 |
+| `src/config/loader.ts` | 配置加载器 (Task 2) | `DEFAULTS` 增加三字段默认值（64000 / 8 / 8000）+ `llm.maxTokens` 默认 4096→8192 + `validateNumericFields` 增加三字段校验 |
+| `src/cli/index.ts` | CLI 入口 (Task 13) | `buildDefaultConfigTemplate()` 同步三字段与 maxTokens |
+| `tests/unit/context.test.ts` | 测试（新增） | 11 个：estimateTokens / truncateText / compressContext（前缀后缀保留、配对不拆、无孤儿 tool 结果、不修改输入、多次压缩） |
+| `tests/unit/config.test.ts` | 测试 | +5 个新字段校验与默认值断言（含非法值 0 / 负数） |
+| `tests/unit/agent-loop.test.ts` | 测试 | +3 个：length 注入继续反馈 / 超长工具输出截断 / 极小窗口触发压缩 |
+
+**⚠️ 影响面说明：**
+- 新增配置字段**向后兼容**——`deepMerge` 会给旧 `.harnessrc.json` 自动补默认值，不破坏存量配置
+- 小任务零行为变化（不触发压缩、工具输出不超 8KB 上限）；大任务 / 长 chat 从「崩溃」变「优雅降级」
+- `contextWindowTokens` 默认 64000 是**保守值**，代码里没有 `deepseek-v4-flash` 官方窗口数字，需按模型卡核实后回填
+- **与设计稿的偏差**：设计稿写「复活 `shouldSummarize()`」，实现改为直接做 token 阈值判断——`shouldSummarize` 带「每 N 轮触发」逻辑，若照用会在上下文远未超限时提前压缩、白白丢历史。`shouldSummarize` 保留未删（有测试、仍是可复用工具）
+
+**测试结果：** 全量 **492** 测试零回归（原 473 + 新增 19），`npx tsc --noEmit` 零错误，`npm run build` 成功。
+
+Commit Hash: `24bafef`
+

@@ -25,11 +25,11 @@ import { GuardrailEngine } from '../guardrails/engine.js';
 import { HITLStateMachine } from '../guardrails/hitl.js';
 import { ScopeFenceGuard } from '../guardrails/scope-fence.js';
 import { DecisionFingerprint } from '../guardrails/fingerprint.js';
-import { SignalExtractor } from '../feedback/extractor.js';
 import { FailureClassifier } from '../feedback/classifier.js';
 import { FeedbackFormatter } from '../feedback/formatter.js';
 import { GuardrailViolation } from '../tools/blacklist.js';
 import { execSync } from 'child_process';
+import { estimateTokens, compressContext, truncateText } from '../memory/context.js';
 
 // ============================================================
 // 类型定义
@@ -49,6 +49,8 @@ export interface AgentResult {
   rounds: number;
   summary: string;
   phase: AgentPhase;
+  /** 最终消息历史（只读副本，供 chat 模式复用） */
+  messages?: Message[];
 }
 
 // ============================================================
@@ -65,6 +67,8 @@ export class AgentLoop {
   readonly hitl: HITLStateMachine;
   /** 范围围栏，公开供测试验证 */
   readonly scopeFence: ScopeFenceGuard;
+  /** 会话消息历史：run() 会重置，continue() 在其上追加 */
+  private messages: Message[] = [];
 
   constructor(config: AgentLoopConfig) {
     this.llm = config.llm;
@@ -77,38 +81,107 @@ export class AgentLoop {
   }
 
   // ============================================================
-  // 公共方法：run()
+  // 公共方法：run() / continue() / getMessages()
   // ============================================================
 
   /**
-   * 执行 Agent 主循环。
+   * 执行 Agent 主循环（单次独立任务）。
+   *
+   * 每次调用会重置会话消息历史，重新构建 system prompt。
    *
    * @param task      用户任务描述（自然语言字符串）
    * @param maxRounds 最大循环轮数（默认 50）
    * @returns 任务完成状态 + 摘要
    */
   async run(task: string, maxRounds: number = 50): Promise<AgentResult> {
-    // ---- 初始化消息数组 ----
-    const messages: Message[] = [];
+    // ---- 重置消息历史（每次 run 是独立任务） ----
+    this.messages = [];
 
     // ① 上下文组装：system prompt（含记忆摘要）
-    messages.push({
+    this.messages.push({
       role: 'system',
       content: this.buildSystemPrompt(),
     });
 
     // 用户任务
-    messages.push({
+    this.messages.push({
       role: 'user',
       content: task,
     });
 
+    return this.runLoop(maxRounds);
+  }
+
+  /**
+   * 在已有会话历史上追加一条用户消息并继续主循环（多轮对话）。
+   *
+   * 与 run() 的区别：不重置消息历史、不重建 system prompt，而是复用
+   * 之前累积的 system prompt、assistant 回复、工具结果与反馈。
+   *
+   * @param task      用户追加的对话内容
+   * @param maxRounds 本次继续的最大循环轮数（默认 50）
+   * @returns 本次继续的任务完成状态 + 摘要
+   */
+  async continue(task: string, maxRounds: number = 50): Promise<AgentResult> {
+    // 防御性：若尚未初始化（从未 run 过），先补 system prompt
+    if (this.messages.length === 0) {
+      this.messages.push({
+        role: 'system',
+        content: this.buildSystemPrompt(),
+      });
+    }
+
+    // 追加用户消息（绝不重复 push system prompt）
+    this.messages.push({
+      role: 'user',
+      content: task,
+    });
+
+    return this.runLoop(maxRounds);
+  }
+
+  /**
+   * 返回当前会话消息历史的只读副本。
+   *
+   * 深拷贝每一层（消息对象、toolCalls、arguments），
+   * 防止调用方修改返回值而污染内部状态。
+   */
+  getMessages(): Message[] {
+    return this.messages.map((m) => this.cloneMessage(m));
+  }
+
+  // ============================================================
+  // 主循环（run() 与 continue() 共用，避免逻辑复制导致行为分歧）
+  // ============================================================
+
+  /**
+   * 执行主循环体：LLM 调用 → 解析 → 护栏 → 工具执行 → 反馈 → 停机判断。
+   *
+   * @param maxRounds 最大循环轮数
+   * @returns 任务完成状态 + 摘要 + 消息历史
+   */
+  private async runLoop(maxRounds: number): Promise<AgentResult> {
+    let messages = this.messages;
     let round = 0;
     let phase: AgentPhase = 'running';
 
     // ---- 主循环（while，非递归） ----
     while (round < maxRounds && phase === 'running') {
       round++;
+
+      // 上下文预算：估算 token，逼近窗口时压缩（丢弃中间历史，保留锚点）
+      const estimatedTokens = estimateTokens(messages);
+      const windowTokens = this.config.memory.contextWindowTokens;
+      const threshold = this.config.memory.contextThreshold;
+      if (windowTokens > 0 && estimatedTokens / windowTokens >= threshold) {
+        const compressed = compressContext(messages, {
+          keepRecentMessages: this.config.memory.keepRecentMessages,
+        });
+        if (compressed.length < messages.length) {
+          messages = compressed;
+          this.messages = compressed;
+        }
+      }
 
       // ② LLM 调用
       const toolDefs = this.tools.toToolDefs();
@@ -128,6 +201,15 @@ export class AgentLoop {
       if (response.finishReason === 'stop' && response.toolCalls.length === 0) {
         phase = 'completed';
         break;
+      }
+
+      // 输出被 max_tokens 截断且无 tool_calls：注入继续反馈，让模型接着写
+      if (response.finishReason === 'length' && response.toolCalls.length === 0) {
+        messages.push({
+          role: 'system',
+          content: '[FEEDBACK] Output was truncated by max_tokens. Continue from where you stopped.',
+        });
+        continue;
       }
 
       // 防御性：tool_calls 为空但未 stop → 继续下一轮
@@ -172,6 +254,7 @@ export class AgentLoop {
       rounds: round,
       summary: this.buildSummary(messages, phase, round),
       phase,
+      messages: this.getMessages(),
     };
   }
 
@@ -218,7 +301,13 @@ export class AgentLoop {
       return denyFeedback;
     }
 
-    // ---- ④c confirm → HITL 审批 ----
+    // ---- ④c 范围围栏硬拒绝（第三层，优先于 HITL：工作区边界不可协商） ----
+    const fenceBlock = this.applyScopeFenceHardChecks(toolCall, messages);
+    if (fenceBlock) {
+      return fenceBlock;
+    }
+
+    // ---- ④d confirm → HITL 审批 ----
     if (riskAssess.action === 'confirm') {
       const fingerprint = this.buildFingerprint(toolCall);
 
@@ -240,7 +329,48 @@ export class AgentLoop {
       }
     }
 
-    // ---- ④d 范围围栏检查（第三层纵深防御） ----
+    // ---- ④e execute_shell 主机白名单（软约束 → HITL 审批） ----
+    if (toolCall.name === 'execute_shell' && typeof toolCall.arguments.command === 'string') {
+      const hostUrl = this.extractCurlWgetUrl(toolCall.arguments.command);
+      if (hostUrl) {
+        const hostResult = this.scopeFence.validateHost(hostUrl);
+        if (!hostResult.allowed) {
+          // 非白名单主机 → 进入 HITL 审批
+          const fingerprint = this.buildFingerprint(toolCall);
+          return await this.handleHITL(
+            toolCall,
+            fingerprint,
+            `Network request to non-allowed host: ${hostResult.reason}`,
+            messages,
+          );
+        }
+      }
+    }
+
+    // ---- ④f 执行工具（通过护栏 + 范围围栏） ----
+    return this.executeTool(toolCall, messages);
+  }
+
+  /**
+   * 范围围栏硬拒绝（第三层纵深防御，优先于 HITL 审批）。
+   *
+   * 工作区边界是不可协商的硬约束：无论工具调用是否命中 confirm 规则，
+   * 越界写入都必须在此处被硬拒绝，不允许通过 HITL 审批放行。
+   * 因此本方法必须在 confirm/HITL 分支之前执行。
+   *
+   * 覆盖：
+   *   - write_file：路径越界（validatePath）
+   *   - execute_shell：shell 重定向输出路径越界（validateShellCommand）
+   *
+   * 注意：execute_shell 的主机白名单（validateHost）是软约束，不在此处处理，
+   * 由调用方在 HITL 阶段处理（非白名单主机 → 人工审批）。
+   *
+   * @returns 越界时的拒绝反馈；未越界返回 null
+   */
+  private applyScopeFenceHardChecks(
+    toolCall: ToolCall,
+    messages: Message[],
+  ): Feedback | null {
     // write_file: 校验路径是否在工作区内
     if (toolCall.name === 'write_file' && typeof toolCall.arguments.path === 'string') {
       const fenceResult = this.scopeFence.validatePath(toolCall.arguments.path);
@@ -261,9 +391,8 @@ export class AgentLoop {
       }
     }
 
-    // execute_shell: 检测对非白名单主机的网络请求 → 触发 confirm
+    // execute_shell: 校验 shell 重定向输出路径不越界（硬拒绝，同 write_file 的范围围栏）
     if (toolCall.name === 'execute_shell' && typeof toolCall.arguments.command === 'string') {
-      // 校验 shell 重定向输出路径不越界（硬拒绝，同 write_file 的范围围栏）
       const shellPathResult = this.scopeFence.validateShellCommand(
         toolCall.arguments.command,
       );
@@ -283,25 +412,9 @@ export class AgentLoop {
         });
         return fenceFeedback;
       }
-
-      const hostUrl = this.extractCurlWgetUrl(toolCall.arguments.command);
-      if (hostUrl) {
-        const hostResult = this.scopeFence.validateHost(hostUrl);
-        if (!hostResult.allowed) {
-          // 非白名单主机 → 进入 HITL 审批
-          const fingerprint = this.buildFingerprint(toolCall);
-          return await this.handleHITL(
-            toolCall,
-            fingerprint,
-            `Network request to non-allowed host: ${hostResult.reason}`,
-            messages,
-          );
-        }
-      }
     }
 
-    // ---- ④e 执行工具（通过护栏 + 范围围栏） ----
-    return this.executeTool(toolCall, messages);
+    return null;
   }
 
   /**
@@ -402,10 +515,16 @@ export class AgentLoop {
         this.tools,
       );
 
-      // 将执行结果 push 进对话历史
+      // 将执行结果 push 进对话历史（超长 stdout/stderr 截断，避免撑爆上下文；
+      // 原始 execResult 仍用于下方反馈分类，保证失败检测看到完整输出）
+      const contextResult: ExecutionResult = {
+        ...execResult,
+        stdout: truncateText(execResult.stdout, this.config.memory.maxToolResultChars),
+        stderr: truncateText(execResult.stderr, this.config.memory.maxToolResultChars),
+      };
       messages.push({
         role: 'tool',
-        content: JSON.stringify(execResult),
+        content: JSON.stringify(contextResult),
         toolCallId: toolCall.id,
       });
 
@@ -625,5 +744,51 @@ Instructions:
     }
 
     return `Agent finished after ${round} rounds. Phase: ${phase}.`;
+  }
+
+  /**
+   * 深拷贝单条消息，供 getMessages() 返回只读副本。
+   *
+   * 独立克隆 toolCalls 数组及每个 toolCall 的 arguments 对象，
+   * 防止调用方修改返回值时污染内部会话状态。
+   */
+  private cloneMessage(message: Message): Message {
+    const clone: Message = {
+      role: message.role,
+      content: message.content,
+    };
+
+    if (message.toolCallId !== undefined) {
+      clone.toolCallId = message.toolCallId;
+    }
+    if (message.name !== undefined) {
+      clone.name = message.name;
+    }
+    if (message.toolCalls !== undefined) {
+      clone.toolCalls = message.toolCalls.map((tc) => ({
+        id: tc.id,
+        name: tc.name,
+        arguments: this.cloneValue(tc.arguments) as Record<string, unknown>,
+      }));
+    }
+
+    return clone;
+  }
+
+  /**
+   * 递归深拷贝任意 JSON 兼容值（用于克隆 toolCall.arguments）。
+   */
+  private cloneValue(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((v) => this.cloneValue(v));
+    }
+    if (value !== null && typeof value === 'object') {
+      const result: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(value)) {
+        result[key] = this.cloneValue(val);
+      }
+      return result;
+    }
+    return value;
   }
 }

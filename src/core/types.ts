@@ -160,6 +160,12 @@ export interface HarnessConfig {
     maxTokens: number;
     summaryInterval: number;
     contextThreshold: number;
+    /** 模型输入上下文窗口大小（token），用于触发压缩的预算计算 */
+    contextWindowTokens: number;
+    /** 压缩时始终保留的尾部消息条数 */
+    keepRecentMessages: number;
+    /** 单条工具结果推入上下文的字符上限（超限截断） */
+    maxToolResultChars: number;
   };
   feedback: {
     autoFix: boolean;
