@@ -5,7 +5,7 @@ import { ToolRegistry } from '../../src/tools/registry.js';
 import { registerAllTools } from '../../src/tools/builtin/index.js';
 import { MemoryStore } from '../../src/memory/store.js';
 import { ConfigLoader } from '../../src/config/loader.js';
-import type { HarnessConfig, LLMResponse } from '../../src/core/types.js';
+import type { HarnessConfig, LLMResponse, Tool, Message } from '../../src/core/types.js';
 
 // ============================================================
 // 测试辅助函数
@@ -63,6 +63,21 @@ function stopResp(content: string): LLMResponse {
     finishReason: 'stop',
     usage: { promptTokens: 100, completionTokens: 30 },
   };
+}
+
+/** 检测是否存在「孤儿 tool 结果」：tool 消息前没有带 toolCalls 的 assistant */
+function hasOrphanToolResult(msgs: Message[]): boolean {
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].role !== 'tool') continue;
+    let j = i - 1;
+    while (j >= 0 && msgs[j].role === 'tool') j--;
+    if (j < 0) return true;
+    const prev = msgs[j];
+    if (prev.role !== 'assistant' || !prev.toolCalls || prev.toolCalls.length === 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ============================================================
@@ -1243,5 +1258,148 @@ describe('AgentLoop', () => {
     const decisions = memory.getAllDecisions();
     // search_code 不自动记录决策（只有 deny/confirm 才记录），这里验证不崩溃
     expect(decisions.length).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ============================================================
+// 上下文预算管理与输出长度处理
+// ============================================================
+
+describe('AgentLoop — 上下文预算与输出长度', () => {
+  /** 返回超大 stdout 的自定义工具，用于截断测试（零子进程、纯确定性） */
+  function hugeTool(): Tool {
+    return {
+      name: 'huge_output',
+      description: 'Returns a huge stdout for truncation testing.',
+      parameters: { type: 'object', properties: {}, required: [] },
+      riskHint: 'low',
+      async execute() {
+        return {
+          toolName: 'huge_output',
+          success: true,
+          stdout: 'x'.repeat(30000),
+          stderr: '',
+          exitCode: 0,
+        };
+      },
+    };
+  }
+
+  // ---- finish_reason = length ----
+  it('injects continue-feedback and continues on finish_reason length', async () => {
+    const mockLLM = new MockLLMProvider([
+      {
+        content: 'part of a long answer that got cut off',
+        toolCalls: [],
+        finishReason: 'length',
+        usage: { promptTokens: 30, completionTokens: 4096 },
+      },
+      stopResp('... the rest of the answer. Done.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config: noChecksConfig,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    const result = await loop.run('Write a long answer');
+    expect(result.rounds).toBe(2);
+    expect(result.success).toBe(true);
+
+    // 第二轮消息中应包含「输出被截断」的继续反馈
+    const round2Messages = mockLLM.history[1].messages;
+    const feedback = round2Messages.find(
+      (m) =>
+        m.role === 'system' &&
+        m.content.includes('truncated') &&
+        m.content.includes('max_tokens'),
+    );
+    expect(feedback).toBeDefined();
+  });
+
+  // ---- 工具输出截断 ----
+  it('truncates oversized tool result when pushing to context', async () => {
+    const mockLLM = new MockLLMProvider([
+      {
+        content: null,
+        toolCalls: [{ id: '1', name: 'huge_output', arguments: {} }],
+        finishReason: 'tool_calls',
+        usage: { promptTokens: 10, completionTokens: 5 },
+      },
+      stopResp('Done.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registry.register(hugeTool());
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config: noChecksConfig,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    await loop.run('Get huge output');
+
+    // 第二轮 LLM 看到的 tool 消息应被截断（30000 字符 → 8000 + 标记）
+    const round2Messages = mockLLM.history[1].messages;
+    const toolMsg = round2Messages.find((m) => m.role === 'tool');
+    expect(toolMsg).toBeDefined();
+    expect(toolMsg!.content).toContain('TRUNCATED');
+    expect(toolMsg!.content.length).toBeLessThan(15000);
+  });
+
+  // ---- 上下文压缩触发 ----
+  it('compresses context when token estimate exceeds window threshold', async () => {
+    const config = makeConfig({
+      memory: {
+        contextWindowTokens: 40, // 极小窗口，阈值 ≈ 32 token
+        keepRecentMessages: 4,
+      },
+    });
+
+    // 多轮 tool_call，让 messages 累积到超过阈值
+    const responses: LLMResponse[] = [];
+    for (let i = 0; i < 6; i++) {
+      responses.push({
+        content: null,
+        toolCalls: [{ id: String(i), name: 'list_directory', arguments: { path: '.' } }],
+        finishReason: 'tool_calls',
+        usage: { promptTokens: 50, completionTokens: 20 },
+      });
+    }
+    responses.push(stopResp('Done.'));
+
+    const mockLLM = new MockLLMProvider(responses);
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    const result = await loop.run('Do many rounds');
+    expect(result.success).toBe(true);
+
+    // 某一次 LLM 调用收到的 messages 中应包含 [context truncated] 标记
+    const anyTruncated = mockLLM.history.some((call) =>
+      call.messages.some(
+        (m) => m.role === 'system' && m.content.includes('context truncated'),
+      ),
+    );
+    expect(anyTruncated).toBe(true);
+
+    // 且每次调用都不产生孤儿 tool 结果（配对不变量）
+    for (const call of mockLLM.history) {
+      expect(hasOrphanToolResult(call.messages)).toBe(false);
+    }
   });
 });

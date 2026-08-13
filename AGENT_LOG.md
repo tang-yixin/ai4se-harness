@@ -657,3 +657,23 @@ Commit Hash: `b4b1cfe`
 
 Commit Hash: `04aa43f`
 
+---
+
+### 🔧 跨 Task 修复：范围围栏硬拒绝失效（confirm 规则抢先拦截，Task 8 + 12 + 13）
+
+时间：2026-08-13  
+涉及分支：`task/16-interactive-chat`  
+审核问题：`echo -n 'hello world' > ../test.txt`、`write_file ../test.txt` 本应被第三层范围围栏硬拒绝（`SCOPE FENCE BLOCK`，不弹窗），却只触发 confirm 规则弹 HITL 审批——approve 直接执行、deny 后 agent 换 `write_file`/`sed -i` 继续绕过，越界写仍成功。
+
+**根因：** `processToolCall()` 里范围围栏硬拒绝（`validatePath` / `validateShellCommand`）排在 `confirm → HITL` 分支之后。`798c03b` 那次修复同时做了两件互相冲突的事：范围围栏加了 `validateShellCommand()`（硬拒绝 `> ../`），又在配置模板加了 `execute_shell > \s*\.\.\/ → confirm` 等 confirm 规则——两者抢同一件事，confirm 却排前面，把「硬拒绝」降级成「可审批 confirm」。`validateShellCommand()` 本身没坏，坏在调用顺序。
+
+**修复：**
+- **方案 1（`src/core/agent-loop.ts`）**：提取 `applyScopeFenceHardChecks()`（含 `write_file validatePath` + `execute_shell validateShellCommand`），提前到 deny 之后、confirm 之前——工作区边界是不可协商的硬约束，先于 HITL，HITL approve 不得绕过；`validateHost`（非白名单主机 → HITL）是软约束，留在原位。
+- **方案 2（`src/cli/index.ts` + `.harnessrc.json`）**：删 3 条与范围围栏重复的 confirm 规则（`execute_shell > ../`、`> ..\`、`write_file ../`），新顺序下它们已成死规则。
+
+**测试：** `tests/unit/agent-loop.test.ts` +2 个（execute_shell 重定向越界 / write_file 越界，同时命中 confirm 规则时断言走 `SCOPE FENCE BLOCK` 而非 HITL），改 2 个 HITL fixture（原用 `write_file ../outside` 触发 HITL，改用 `execute_shell sudo.*`），全量 **473** 测试零回归，`npx tsc --noEmit` 零错误。
+
+**已知局限（接受，不修复）：** `cp test.txt ../test.txt`、`sed -i`、`cd ..` 等不经过重定向符号的写命令仍可绕过——shell 表达力无限，字符串匹配永远堵不完（打地鼠）。彻底解决需 OS 级沙箱（容器 / 权限降级 / 文件系统 ACL），超出当前「确定性代码 + 字符串级护栏」的定位，可归入 Task 15 或不修复。
+
+Commit Hash: `ff25f20`
+

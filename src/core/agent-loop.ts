@@ -29,6 +29,7 @@ import { FailureClassifier } from '../feedback/classifier.js';
 import { FeedbackFormatter } from '../feedback/formatter.js';
 import { GuardrailViolation } from '../tools/blacklist.js';
 import { execSync } from 'child_process';
+import { estimateTokens, compressContext, truncateText } from '../memory/context.js';
 
 // ============================================================
 // 类型定义
@@ -160,13 +161,27 @@ export class AgentLoop {
    * @returns 任务完成状态 + 摘要 + 消息历史
    */
   private async runLoop(maxRounds: number): Promise<AgentResult> {
-    const messages = this.messages;
+    let messages = this.messages;
     let round = 0;
     let phase: AgentPhase = 'running';
 
     // ---- 主循环（while，非递归） ----
     while (round < maxRounds && phase === 'running') {
       round++;
+
+      // 上下文预算：估算 token，逼近窗口时压缩（丢弃中间历史，保留锚点）
+      const estimatedTokens = estimateTokens(messages);
+      const windowTokens = this.config.memory.contextWindowTokens;
+      const threshold = this.config.memory.contextThreshold;
+      if (windowTokens > 0 && estimatedTokens / windowTokens >= threshold) {
+        const compressed = compressContext(messages, {
+          keepRecentMessages: this.config.memory.keepRecentMessages,
+        });
+        if (compressed.length < messages.length) {
+          messages = compressed;
+          this.messages = compressed;
+        }
+      }
 
       // ② LLM 调用
       const toolDefs = this.tools.toToolDefs();
@@ -186,6 +201,15 @@ export class AgentLoop {
       if (response.finishReason === 'stop' && response.toolCalls.length === 0) {
         phase = 'completed';
         break;
+      }
+
+      // 输出被 max_tokens 截断且无 tool_calls：注入继续反馈，让模型接着写
+      if (response.finishReason === 'length' && response.toolCalls.length === 0) {
+        messages.push({
+          role: 'system',
+          content: '[FEEDBACK] Output was truncated by max_tokens. Continue from where you stopped.',
+        });
+        continue;
       }
 
       // 防御性：tool_calls 为空但未 stop → 继续下一轮
@@ -491,10 +515,16 @@ export class AgentLoop {
         this.tools,
       );
 
-      // 将执行结果 push 进对话历史
+      // 将执行结果 push 进对话历史（超长 stdout/stderr 截断，避免撑爆上下文；
+      // 原始 execResult 仍用于下方反馈分类，保证失败检测看到完整输出）
+      const contextResult: ExecutionResult = {
+        ...execResult,
+        stdout: truncateText(execResult.stdout, this.config.memory.maxToolResultChars),
+        stderr: truncateText(execResult.stderr, this.config.memory.maxToolResultChars),
+      };
       messages.push({
         role: 'tool',
-        content: JSON.stringify(execResult),
+        content: JSON.stringify(contextResult),
         toolCallId: toolCall.id,
       });
 

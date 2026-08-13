@@ -26,7 +26,7 @@ export class ConfigLoader {
       provider: 'deepseek',
       model: 'deepseek-chat',
       baseURL: 'https://api.deepseek.com/v1',
-      maxTokens: 4096,
+      maxTokens: 8192,
     },
     guardrails: {
       rules: [],
@@ -41,6 +41,9 @@ export class ConfigLoader {
       maxTokens: 2000,
       summaryInterval: 10,
       contextThreshold: 0.8,
+      contextWindowTokens: 64000,
+      keepRecentMessages: 8,
+      maxToolResultChars: 8000,
     },
     feedback: {
       autoFix: true,
@@ -302,6 +305,30 @@ export class ConfigLoader {
     if (typeof contextThreshold !== 'number' || contextThreshold < 0 || contextThreshold > 1) {
       throw new ConfigError(
         `memory.contextThreshold must be between 0 and 1 inclusive, got ${JSON.stringify(contextThreshold)}.`,
+      );
+    }
+
+    // memory.contextWindowTokens
+    const contextWindowTokens = (config.memory as Record<string, unknown>)?.contextWindowTokens;
+    if (typeof contextWindowTokens !== 'number' || contextWindowTokens <= 0 || !Number.isFinite(contextWindowTokens)) {
+      throw new ConfigError(
+        `memory.contextWindowTokens must be a positive number, got ${JSON.stringify(contextWindowTokens)}.`,
+      );
+    }
+
+    // memory.keepRecentMessages
+    const keepRecentMessages = (config.memory as Record<string, unknown>)?.keepRecentMessages;
+    if (typeof keepRecentMessages !== 'number' || keepRecentMessages <= 0 || !Number.isFinite(keepRecentMessages)) {
+      throw new ConfigError(
+        `memory.keepRecentMessages must be a positive number, got ${JSON.stringify(keepRecentMessages)}.`,
+      );
+    }
+
+    // memory.maxToolResultChars
+    const maxToolResultChars = (config.memory as Record<string, unknown>)?.maxToolResultChars;
+    if (typeof maxToolResultChars !== 'number' || maxToolResultChars <= 0 || !Number.isFinite(maxToolResultChars)) {
+      throw new ConfigError(
+        `memory.maxToolResultChars must be a positive number, got ${JSON.stringify(maxToolResultChars)}.`,
       );
     }
 

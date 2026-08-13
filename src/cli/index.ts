@@ -415,7 +415,7 @@ function buildDefaultConfigTemplate(): string {
       provider: 'deepseek',
       model: 'deepseek-chat',
       baseURL: 'https://api.deepseek.com/v1',
-      maxTokens: 4096,
+      maxTokens: 8192,
     },
     guardrails: {
       rules: [
@@ -434,6 +434,9 @@ function buildDefaultConfigTemplate(): string {
       maxTokens: 2000,
       summaryInterval: 10,
       contextThreshold: 0.8,
+      contextWindowTokens: 64000,
+      keepRecentMessages: 8,
+      maxToolResultChars: 8000,
     },
     feedback: {
       autoFix: true,

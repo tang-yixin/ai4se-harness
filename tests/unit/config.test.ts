@@ -28,7 +28,7 @@ describe('ConfigLoader', () => {
     expect(config.llm.provider).toBe('deepseek');
     expect(config.llm.model).toBe('deepseek-chat');
     expect(config.llm.baseURL).toBe('https://api.deepseek.com/v1');
-    expect(config.llm.maxTokens).toBe(4096);
+    expect(config.llm.maxTokens).toBe(8192);
     // 护栏默认值
     expect(config.guardrails.rules).toEqual([]);
     expect(config.guardrails.hitlTimeoutSeconds).toBe(60);
@@ -40,6 +40,9 @@ describe('ConfigLoader', () => {
     expect(config.memory.maxTokens).toBe(2000);
     expect(config.memory.summaryInterval).toBe(10);
     expect(config.memory.contextThreshold).toBe(0.8);
+    expect(config.memory.contextWindowTokens).toBe(64000);
+    expect(config.memory.keepRecentMessages).toBe(8);
+    expect(config.memory.maxToolResultChars).toBe(8000);
     // 反馈默认值
     expect(config.feedback.autoFix).toBe(true);
     expect(config.feedback.maxRetries).toBe(3);
@@ -335,6 +338,40 @@ describe('ConfigLoader', () => {
     const bad = JSON.stringify({ memory: { summaryInterval: 0 } });
     writeFileSync(tmpConfig, bad);
     expect(() => ConfigLoader.load(tmpConfig)).toThrow(ConfigError);
+  });
+
+  it('contextWindowTokens 为 0 时抛出 ConfigError', () => {
+    const bad = JSON.stringify({ memory: { contextWindowTokens: 0 } });
+    writeFileSync(tmpConfig, bad);
+    expect(() => ConfigLoader.load(tmpConfig)).toThrow(ConfigError);
+  });
+
+  it('contextWindowTokens 为负数时抛出 ConfigError', () => {
+    const bad = JSON.stringify({ memory: { contextWindowTokens: -1 } });
+    writeFileSync(tmpConfig, bad);
+    expect(() => ConfigLoader.load(tmpConfig)).toThrow(ConfigError);
+  });
+
+  it('keepRecentMessages 为 0 时抛出 ConfigError', () => {
+    const bad = JSON.stringify({ memory: { keepRecentMessages: 0 } });
+    writeFileSync(tmpConfig, bad);
+    expect(() => ConfigLoader.load(tmpConfig)).toThrow(ConfigError);
+  });
+
+  it('maxToolResultChars 为 0 时抛出 ConfigError', () => {
+    const bad = JSON.stringify({ memory: { maxToolResultChars: 0 } });
+    writeFileSync(tmpConfig, bad);
+    expect(() => ConfigLoader.load(tmpConfig)).toThrow(ConfigError);
+  });
+
+  it('新增 memory 字段通过合法值校验', () => {
+    writeFileSync(tmpConfig, JSON.stringify({
+      memory: { contextWindowTokens: 32000, keepRecentMessages: 5, maxToolResultChars: 4000 },
+    }));
+    const config = ConfigLoader.load(tmpConfig);
+    expect(config.memory.contextWindowTokens).toBe(32000);
+    expect(config.memory.keepRecentMessages).toBe(5);
+    expect(config.memory.maxToolResultChars).toBe(4000);
   });
 
   it('contextThreshold 大于 1 时抛出 ConfigError', () => {
