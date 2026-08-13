@@ -277,7 +277,13 @@ export class AgentLoop {
       return denyFeedback;
     }
 
-    // ---- ④c confirm → HITL 审批 ----
+    // ---- ④c 范围围栏硬拒绝（第三层，优先于 HITL：工作区边界不可协商） ----
+    const fenceBlock = this.applyScopeFenceHardChecks(toolCall, messages);
+    if (fenceBlock) {
+      return fenceBlock;
+    }
+
+    // ---- ④d confirm → HITL 审批 ----
     if (riskAssess.action === 'confirm') {
       const fingerprint = this.buildFingerprint(toolCall);
 
@@ -299,7 +305,48 @@ export class AgentLoop {
       }
     }
 
-    // ---- ④d 范围围栏检查（第三层纵深防御） ----
+    // ---- ④e execute_shell 主机白名单（软约束 → HITL 审批） ----
+    if (toolCall.name === 'execute_shell' && typeof toolCall.arguments.command === 'string') {
+      const hostUrl = this.extractCurlWgetUrl(toolCall.arguments.command);
+      if (hostUrl) {
+        const hostResult = this.scopeFence.validateHost(hostUrl);
+        if (!hostResult.allowed) {
+          // 非白名单主机 → 进入 HITL 审批
+          const fingerprint = this.buildFingerprint(toolCall);
+          return await this.handleHITL(
+            toolCall,
+            fingerprint,
+            `Network request to non-allowed host: ${hostResult.reason}`,
+            messages,
+          );
+        }
+      }
+    }
+
+    // ---- ④f 执行工具（通过护栏 + 范围围栏） ----
+    return this.executeTool(toolCall, messages);
+  }
+
+  /**
+   * 范围围栏硬拒绝（第三层纵深防御，优先于 HITL 审批）。
+   *
+   * 工作区边界是不可协商的硬约束：无论工具调用是否命中 confirm 规则，
+   * 越界写入都必须在此处被硬拒绝，不允许通过 HITL 审批放行。
+   * 因此本方法必须在 confirm/HITL 分支之前执行。
+   *
+   * 覆盖：
+   *   - write_file：路径越界（validatePath）
+   *   - execute_shell：shell 重定向输出路径越界（validateShellCommand）
+   *
+   * 注意：execute_shell 的主机白名单（validateHost）是软约束，不在此处处理，
+   * 由调用方在 HITL 阶段处理（非白名单主机 → 人工审批）。
+   *
+   * @returns 越界时的拒绝反馈；未越界返回 null
+   */
+  private applyScopeFenceHardChecks(
+    toolCall: ToolCall,
+    messages: Message[],
+  ): Feedback | null {
     // write_file: 校验路径是否在工作区内
     if (toolCall.name === 'write_file' && typeof toolCall.arguments.path === 'string') {
       const fenceResult = this.scopeFence.validatePath(toolCall.arguments.path);
@@ -320,9 +367,8 @@ export class AgentLoop {
       }
     }
 
-    // execute_shell: 检测对非白名单主机的网络请求 → 触发 confirm
+    // execute_shell: 校验 shell 重定向输出路径不越界（硬拒绝，同 write_file 的范围围栏）
     if (toolCall.name === 'execute_shell' && typeof toolCall.arguments.command === 'string') {
-      // 校验 shell 重定向输出路径不越界（硬拒绝，同 write_file 的范围围栏）
       const shellPathResult = this.scopeFence.validateShellCommand(
         toolCall.arguments.command,
       );
@@ -342,25 +388,9 @@ export class AgentLoop {
         });
         return fenceFeedback;
       }
-
-      const hostUrl = this.extractCurlWgetUrl(toolCall.arguments.command);
-      if (hostUrl) {
-        const hostResult = this.scopeFence.validateHost(hostUrl);
-        if (!hostResult.allowed) {
-          // 非白名单主机 → 进入 HITL 审批
-          const fingerprint = this.buildFingerprint(toolCall);
-          return await this.handleHITL(
-            toolCall,
-            fingerprint,
-            `Network request to non-allowed host: ${hostResult.reason}`,
-            messages,
-          );
-        }
-      }
     }
 
-    // ---- ④e 执行工具（通过护栏 + 范围围栏） ----
-    return this.executeTool(toolCall, messages);
+    return null;
   }
 
   /**

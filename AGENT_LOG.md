@@ -636,3 +636,24 @@ Task：Task 16 - 交互式多轮对话（chat 模式）
 
 Commit Hash: `b4b1cfe`
 
+---
+
+### 🔧 跨 Task 修复：chat 模式 HITL 审批输入串扰与异常退出（Task 13 + 16）
+
+时间：2026-08-13  
+涉及分支：`task/16-interactive-chat`  
+审核问题：`harness chat` 中 HITL 审批弹窗输入多字符（如 `aa`）会泄漏成下一轮对话消息；且偶发异常退出（`harness>` 提示后进程直接返回 shell）。
+
+**根因：** chat REPL 与 HITL 审批各建一个 `readline.Interface` 共享同一个 `stdin`，两个接口竞争——输入被重复/拆分消费（多输入的字符残留进下一轮），第二个接口 `close()` 干扰 REPL 流状态使 `for await` 提前结束。
+
+**修复（`src/cli/index.ts`）：**
+- 抽取 `registerHitlPrompt(loop, ask)`；导出 `runChatRepl(loop, rl, ask?)`（导出仅供测试，非 CLI 公共 API）
+- chat 命令改用**单一 rl + 回调驱动的 `question()` 循环**（替代 `for await` + `promptLine` 每次新建接口），HITL 复用同一个 `rl`
+- 非 TTY 保持无人值守：`ask = stdin.isTTY ? ... : undefined`，`runChatRepl` 仅在 `ask` 存在时才注册 HITL → 自动拒绝
+- `runChatRepl` 出错时 `reject` 交由 chat action 统一 `exit(1)`，不再在库函数内 `process.exit`
+- `initAgentLoop` 移除 HITL 注册块，run/chat 各自注册（run 保留 TTY 守卫 + `promptLine`）
+
+**测试：** `tests/unit/chat-repl.test.ts` +4 个（`aa` 泄漏 / `a` 审批通过 / 空行 + quit / 无人值守自动拒绝），全量 **471** 测试零回归，`npx tsc --noEmit` 零错误。
+
+Commit Hash: `04aa43f`
+

@@ -421,9 +421,6 @@ function buildDefaultConfigTemplate(): string {
       rules: [
         { tool: 'execute_shell', pattern: 'sudo.*', action: 'confirm' },
         { tool: 'execute_shell', pattern: '(curl|wget).*\\|.*(bash|sh)', action: 'deny' },
-        { tool: 'execute_shell', pattern: '>\\s*\\.\\.\\/', action: 'confirm' },
-        { tool: 'execute_shell', pattern: '>\\s*\\.\\.\\\\', action: 'confirm' },
-        { tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' },
         { tool: 'write_file', pattern: '^\\/(etc|var|tmp)\\/', action: 'confirm' },
       ],
       hitlTimeoutSeconds: 60,

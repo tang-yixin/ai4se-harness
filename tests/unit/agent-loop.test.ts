@@ -236,28 +236,21 @@ describe('AgentLoop', () => {
 
   // ---- HITL submit 后 timeout 自动拒绝 ----
   it('auto-denies HITL request on timeout in automated mode', async () => {
-    // 使用 confirm 规则 + 0 秒超时（立即超时）
+    // 用不越界的高风险命令（sudo）触发 HITL confirm，验证无人值守下自动拒绝
     const config = makeConfig({
       guardrails: {
         rules: [
-          { tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' },
+          { tool: 'execute_shell', pattern: 'sudo.*', action: 'confirm' },
         ],
         hitlTimeoutSeconds: 0, // 立即超时
       },
     });
 
     const mockLLM = new MockLLMProvider([
-      // 第一轮：尝试写入工作区外的文件（触发 confirm → HITL → timeout）
-      {
-        content: null,
-        toolCalls: [
-          { id: '1', name: 'write_file', arguments: { path: '../outside/file.ts', content: 'test' } },
-        ],
-        finishReason: 'tool_calls',
-        usage: { promptTokens: 30, completionTokens: 10 },
-      },
-      // 第二轮：收到 HITL 超时反馈后结束
-      stopResp('The write operation was not approved. Task stopped.'),
+      // 第一轮：执行高风险 sudo 命令（触发 confirm → HITL → 无人值守拒绝）
+      toolCallResp('execute_shell', { command: 'sudo systemctl restart nginx' }, '1'),
+      // 第二轮：收到 HITL 拒绝反馈后结束
+      stopResp('The sudo command was not approved. Task stopped.'),
     ]);
 
     const registry = new ToolRegistry();
@@ -270,17 +263,12 @@ describe('AgentLoop', () => {
       memory: new MemoryStore(memoryConfig),
     });
 
-    const result = await loop.run('Write file outside workspace');
+    const result = await loop.run('Run a sudo command');
 
     // 验证跑了两轮
     expect(result.rounds).toBe(2);
 
-    // 第一轮中不应该实际执行 write_file（HITL timeout 应该阻止）
-    const round1Messages = mockLLM.history[0].messages;
-    // 应该包含 HITL timeout 相关的消息
-    // verify: no actual file write happened (the tool was blocked by HITL)
-
-    // 第二轮消息中应该有超时/被拒绝的提示
+    // 第二轮消息中应该有 HITL 拒绝的提示
     const round2Messages = mockLLM.history[1].messages;
     const hitlMsg = round2Messages.find(
       (m) =>
@@ -654,23 +642,17 @@ describe('AgentLoop', () => {
   // P0-2: HITL APPROVED（外部审批通过）路径
   // ============================================================
   it('executes tool when HITL is externally approved', async () => {
+    // 用不越界的高风险命令（sudo）触发 HITL confirm，验证 approve 后工具被执行
     const config = makeConfig({
       guardrails: {
-        rules: [{ tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' }],
+        rules: [{ tool: 'execute_shell', pattern: 'sudo.*', action: 'confirm' }],
         hitlTimeoutSeconds: 60,
       },
     });
 
     const mockLLM = new MockLLMProvider([
-      {
-        content: null,
-        toolCalls: [
-          { id: '1', name: 'write_file', arguments: { path: '../outside/file.ts', content: 'test' } },
-        ],
-        finishReason: 'tool_calls',
-        usage: { promptTokens: 30, completionTokens: 10 },
-      },
-      stopResp('File written successfully (HITL approved).'),
+      toolCallResp('execute_shell', { command: 'sudo echo hi' }, '1'),
+      stopResp('The sudo command was executed (HITL approved).'),
     ]);
 
     const registry = new ToolRegistry();
@@ -688,11 +670,18 @@ describe('AgentLoop', () => {
       loop.hitl.approve(req.id);
     };
 
-    const result = await loop.run('Write file outside workspace');
+    const result = await loop.run('Run a sudo command');
 
     // HITL 被外部 approve → 工具应被执行
     expect(result.rounds).toBe(2);
     expect(result.success).toBe(true);
+
+    // 确认 execute_shell 被真正执行（而非 SCOPE FENCE BLOCK 或 HITL denied）
+    const round2Messages = mockLLM.history[1].messages;
+    const executed = round2Messages.find(
+      (m) => m.role === 'tool' && m.content.includes('"toolName":"execute_shell"'),
+    );
+    expect(executed).toBeDefined();
   });
 
   // ============================================================
@@ -827,6 +816,92 @@ describe('AgentLoop', () => {
       (m) => m.role === 'tool' && (m.content.includes('HITL') || m.content.includes('timeout')),
     );
     expect(hitlMsg).toBeDefined();
+  });
+
+  // ============================================================
+  // P1-5b: 范围围栏硬拒绝优先于 confirm 规则
+  // ============================================================
+  it('blocks execute_shell redirect outside workspace even when confirm rule matches', async () => {
+    // 同时命中 confirm 规则（> \s*\.\.\/ → confirm）与范围围栏硬拒绝：
+    // 范围围栏必须优先，直接 SCOPE FENCE BLOCK，不弹 HITL
+    const config = makeConfig({
+      guardrails: {
+        rules: [
+          { tool: 'execute_shell', pattern: '>\\s*\\.\\.\\/', action: 'confirm' },
+        ],
+        hitlTimeoutSeconds: 60,
+      },
+    });
+
+    const mockLLM = new MockLLMProvider([
+      toolCallResp('execute_shell', { command: "echo 'hello' > ../test.txt" }, '1'),
+      stopResp('The redirect was blocked by scope fence.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    await loop.run('Write outside workspace via shell redirect');
+
+    const round2Messages = mockLLM.history[1].messages;
+    const fenceMsg = round2Messages.find(
+      (m) => m.role === 'tool' && m.content.includes('SCOPE FENCE BLOCK'),
+    );
+    expect(fenceMsg).toBeDefined();
+
+    // 不应走 HITL 审批路径
+    const hitlMsg = round2Messages.find(
+      (m) =>
+        m.role === 'tool' &&
+        (m.content.includes('HITL') || m.content.includes('timeout')),
+    );
+    expect(hitlMsg).toBeUndefined();
+  });
+
+  it('blocks write_file outside workspace even when confirm rule matches', async () => {
+    const config = makeConfig({
+      guardrails: {
+        rules: [{ tool: 'write_file', pattern: '\\.\\.\\/', action: 'confirm' }],
+        hitlTimeoutSeconds: 60,
+      },
+    });
+
+    const mockLLM = new MockLLMProvider([
+      toolCallResp('write_file', { path: '../outside/file.ts', content: 'test' }, '1'),
+      stopResp('The write was blocked by scope fence.'),
+    ]);
+
+    const registry = new ToolRegistry();
+    registerAllTools(registry);
+
+    const loop = new AgentLoop({
+      llm: mockLLM,
+      tools: registry,
+      config,
+      memory: new MemoryStore(memoryConfig),
+    });
+
+    await loop.run('Write outside workspace');
+
+    const round2Messages = mockLLM.history[1].messages;
+    const fenceMsg = round2Messages.find(
+      (m) => m.role === 'tool' && m.content.includes('SCOPE FENCE BLOCK'),
+    );
+    expect(fenceMsg).toBeDefined();
+
+    const hitlMsg = round2Messages.find(
+      (m) =>
+        m.role === 'tool' &&
+        (m.content.includes('HITL') || m.content.includes('timeout')),
+    );
+    expect(hitlMsg).toBeUndefined();
   });
 
   // ============================================================
