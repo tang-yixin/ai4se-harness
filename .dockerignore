@@ -1,0 +1,17 @@
+# 依赖与构建产物（镜像内由 npm ci / npm run build 重新生成）
+node_modules
+dist
+
+# 版本控制与 CI 元数据
+.git
+.github
+
+# 单元测试（运行时镜像无需携带）
+tests
+
+# 本地配置与日志（凭据存于 ~/.ai4se-harness，与镜像内容无关）
+.harnessrc.json
+.env
+.env.*
+*.log
+AGENT_LOG.md

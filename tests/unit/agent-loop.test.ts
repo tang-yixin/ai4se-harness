@@ -1125,6 +1125,28 @@ describe('AgentLoop', () => {
   // P1 补充: ScopeFenceGuard 允许工作区内路径
   // ============================================================
   it('allows write_file inside workspace root via ScopeFenceGuard', async () => {
+    // 用不写盘的 mock write_file 覆盖真实工具，避免测试污染 src/ 目录
+    const mockWriteFileTool: Tool = {
+      name: 'write_file',
+      description: 'Mock write_file that does not touch the filesystem',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          content: { type: 'string' },
+        },
+        required: ['path', 'content'],
+      },
+      riskHint: 'medium',
+      execute: async (args) => ({
+        toolName: 'write_file',
+        success: true,
+        stdout: `File written (mock): ${String(args.path)}`,
+        stderr: '',
+        exitCode: 0,
+      }),
+    };
+
     const mockLLM = new MockLLMProvider([
       {
         content: null,
@@ -1139,6 +1161,7 @@ describe('AgentLoop', () => {
 
     const registry = new ToolRegistry();
     registerAllTools(registry);
+    registry.register(mockWriteFileTool); // 覆盖真实 write_file，仅本测试内生效
 
     const loop = new AgentLoop({
       llm: mockLLM,
@@ -1156,6 +1179,12 @@ describe('AgentLoop', () => {
       (m) => m.role === 'tool' && m.content.includes('SCOPE FENCE BLOCK'),
     );
     expect(fenceBlock).toBeUndefined();
+
+    // 确认 mock 工具确实被调用（而非真实写盘）
+    const toolResult = round2Messages.find(
+      (m) => m.role === 'tool' && m.content.includes('File written (mock)'),
+    );
+    expect(toolResult).toBeDefined();
   });
 
   // ============================================================
