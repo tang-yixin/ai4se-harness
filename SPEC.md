@@ -637,30 +637,26 @@ ai4se-harness/
 
 ### 8.2 分发方案
 
-**主方案：npm 包**
+**实际交付：Docker 容器** —— 镜像已发布到 GitHub Container Registry（公开）：`ghcr.io/tang-yixin/ai4se-harness`。
+
+**npm 包（未发布）**：`package.json` 已配置 `"bin"` 字段（`harness` → `dist/cli/index.js`），本地 `npm install -g .` 可全局安装 `harness` 命令；但包尚未发布到 npm registry，`npm install -g ai4se-harness` 暂不可用。分发以 Docker 为准。
 
 ```bash
-npm install -g ai4se-harness
-harness setup    # 配置 DeepSeek API key
-harness run "用 TypeScript 写一个快速排序函数"
-```
+# 方式一：使用已发布的公开镜像
+docker run -it --rm -v $(pwd):/workspace -e DEEPSEEK_API_KEY=sk-... ghcr.io/tang-yixin/ai4se-harness:latest run "你的任务"
 
-`package.json` 中加入 `"bin"` 字段，`npm install -g` 后 `harness` 命令全局可用。
-
-**辅方案：Docker 容器**
-
-```bash
+# 方式二：从源码本地构建
 docker build -t ai4se-harness https://github.com/tang-yixin/ai4se-harness.git
 docker run -it --rm -v $(pwd):/workspace ai4se-harness run "你的任务"
 ```
 
-`docker run` 时需要挂载工作目录（`-v`），并通过环境变量或交互输入传递 API key。
+`docker run` 时需要挂载工作目录（`-v`），并通过环境变量（`-e DEEPSEEK_API_KEY`）或交互输入传递 API key。
 
 **不采用方案：** 原生二进制。TypeScript 项目打包为二进制（`bun build --compile` 或 `pkg`）在做 shell 执行和文件路径解析时容易出现平台相关的奇怪问题，调试成本高且不增加工程深度。
 
 ### 8.3 目标机器 Key 配置方式
 
-- **npm 安装**：执行 `harness setup`，交互式引导录入（隐藏输入），生成 `~/.ai4se-harness/credentials.enc`
+- **源码安装**：`npm install && npm run build && npm install -g .` 后执行 `harness setup`，交互式引导录入（隐藏输入），生成 `~/.ai4se-harness/credentials.enc`
 - **Docker 运行**：通过 `-e DEEPSEEK_API_KEY=sk-...` 环境变量传入（环境变量有明文风险，Docker 内运行相对隔离），或容器内执行 `harness setup` 交互录入
 
 ### 8.4 已知限制
@@ -686,7 +682,7 @@ docker run -it --rm -v $(pwd):/workspace ai4se-harness run "你的任务"
 | 测试框架 | Vitest | 原生 ESM + TypeScript 支持、与 Vite 生态一致、速度快 |
 | CI/CD | GitHub Actions | 免费额度、与 GitHub 仓库深度集成 |
 | 部署 | ~~任选 Vercel / Railway（学生免费额度）~~（已弃用） | ~~WebUI 仅需轻量 HTTP 服务，无数据库~~ |
-| 分发 | npm（主）+ Docker（辅） | npm 面向 TS/JS 开发者最自然；Docker 兜底任意环境 |
+| 分发 | Docker（已发布 GHCR 公开镜像） | 跨平台一致、免装 Node；npm 包已配 bin 但未发布 registry |
 
 ---
 
@@ -704,7 +700,7 @@ docker run -it --rm -v $(pwd):/workspace ai4se-harness run "你的任务"
 | 8 | 一键测试 | `npm test` 或 `make test` 运行全部单元测试且全绿（零网络依赖） |
 | 9 | CI pass | GitHub Actions 中 `unit-test` job 通过 |
 | 10 | ~~WebUI 可访问~~（已弃用） | ~~`localhost:3099/status` 返回当前会话状态 JSON~~ |
-| 11 | npm 安装 | `npm install -g` 后 `harness --version` 输出版本号 |
+| 11 | 源码全局安装 | `npm install -g .` 后 `harness --version` 输出版本号 |
 | 12 | Docker 运行 | `docker run ai4se-harness --version` 输出版本号 |
 
 ---

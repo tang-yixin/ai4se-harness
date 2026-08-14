@@ -31,7 +31,7 @@
 
 ---
 
-## Phase 3: 实现阶段
+## Phase 2: 实现阶段
 
 > **格式说明**：每个 task 完成后记一条。以下为示例格式，实际内容在 task 完成后填写。
 
@@ -92,7 +92,7 @@ Commit Hash:
 - [x] Task 12: Agent 主循环
 - [x] Task 13: CLI 入口
 - [x] Task 14: WebUI（⛔ 已弃用——项目定位单机 CLI，WebUI 审批无场景）
-- [ ] Task 15: 集成测试 + Docker + README
+- [x] Task 15: 集成测试 + Docker + README
 - [x] Task 16: 交互式多轮对话（chat 模式）
 
 ---
@@ -760,5 +760,21 @@ CI 问题：GitHub Actions（`ubuntu-latest`）跑 `tests/unit/scope-fence.test.
 
 **验证（双平台）：** 本地 Windows 与 Docker Linux（`node:22-alpine`，模拟 CI）均 `npx tsc --noEmit` 零错误、`npm test` **492/492** 全绿，之前失败的 3 个用例在 Linux 上全部通过。
 
-Commit Hash: `（scope-fence.ts 待提交）`
+Commit Hash: `9d32f61`
+
+---
+
+### 🔀 最终审查 + GHCR 镜像发布（final-review）
+
+时间：2026-08-14  
+涉及分支：`final-review`  
+做了什么：对照两份作业要求做最终审查，补齐交付缺口——
+- CI（`.github/workflows/ci.yml`）新增 `docker-build` job（§4.8 要求）
+- 新增 `tests/unit/mechanism-demo.test.ts`（SPEC §A.6 机制演示：黑名单拦截 / 反馈闭环 / 范围围栏，3 用例）
+- `src/cli/index.ts` 新增 `.env` 加载（§3.1），`tests/unit/env.test.ts` 10 用例
+- `PLAN.md` 顶部注明「task 状态以 AGENT_LOG 为准」；AGENT_LOG checklist 勾选 Task 15
+- 新建 `REFLECTION.md`；README 补机制演示 / `.env` / 公开镜像；SPEC §8.2 补 GHCR 分发
+- 镜像发布到 GHCR 公开仓库 `ghcr.io/tang-yixin/ai4se-harness:latest`，匿名 `docker run --version` 输出 `1.0.0` 验证通过
+
+全量测试 **505/505** 零回归，`npx tsc --noEmit` 零错误。
 
