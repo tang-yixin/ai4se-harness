@@ -92,13 +92,12 @@ Agent 主循环是 harness 的核心引擎，负责驱动"上下文组装 → LL
 **输出：** 任务完成状态 + 摘要（成功/失败/被拦截 + 执行轮数 + 修改的文件列表）
 
 **边界条件：**
-- 最大循环轮数可配置（默认 50 轮）
-- 单次 LLM 调用超时（默认 60 秒）
-- 上下文窗口接近上限时触发上下文压缩（阈值 80%）
+- 最大循环轮数默认 50 轮（`run()` / `continue()` 的 `maxRounds` 参数；超限按 error 终止）
+- 上下文窗口接近上限时触发确定性上下文压缩（阈值 80%）
 
 **错误处理：**
-- LLM 调用失败（网络/限流/服务端错误）→ 最多重试 3 次，指数退避，全部失败则终止
-- LLM 返回不可解析的响应 → 将原始响应注入 context，请求 LLM 重新生成
+- LLM 调用失败（网络/限流/服务端错误）→ 归一化为 `finishReason: 'error'` 并终止当前任务（当前版本不自动重试，见 README「已知限制」）
+- LLM 返回不可解析的响应（如 tool_calls 的 arguments JSON 畸形）→ 归一化为 `[PARSE_ERROR]` + `finishReason: 'error'`，主循环终止当前任务
 
 ### 3.2 工具系统
 
@@ -319,7 +318,7 @@ IDLE → WAITING → APPROVED → 执行
 | 加密文件被窃取 | AES-256-GCM 认证加密，无主密码无法解密 |
 | 主密码被暴力破解 | PBKDF2 100,000 轮迭代 |
 | 进程内存 dump 泄露 key | ⚠️ 本项目不防内存 dump（明文 key 在进程内存中，操作系统级攻击面） |
-| `.env` 文件泄露 | 本项目不使用 `.env` 文件存 key（env 变量是明文，且 `export` 进 shell history） |
+| `.env` 文件泄露 | 支持 `.env` 作为本地开发便利来源（不覆盖已存在环境变量）；`.env` 已加入 `.gitignore`，README 已说明其明文风险 |
 
 **安全边界声明：** 本项目假设操作系统用户空间是可信的。不防御内核级攻击、硬件 keylogger、或物理访问。
 
@@ -406,7 +405,8 @@ ai4se-harness/
 ├── src/
 │   ├── core/                  # 主循环
 │   │   ├── agent-loop.ts      #   AgentLoop（7 步骤）
-│   │   └── types.ts           #   核心类型定义
+│   │   ├── types.ts           #   核心类型定义
+│   │   └── platform.ts        #   平台相关工具函数
 │   ├── llm/                   # LLM 抽象层
 │   │   ├── provider.ts        #   LLMProvider 接口
 │   │   ├── deepseek.ts        #   DeepSeekProvider
@@ -439,18 +439,15 @@ ai4se-harness/
 │   │   └── store.ts           #   CredentialStore（PBKDF2 + AES-256-GCM）
 │   ├── cli/                   # CLI 入口
 │   │   └── index.ts           #   commander.js 入口
-│   └── web/                   # ~~WebUI（轻量仪表盘）~~（已弃用）
-│       └── server.ts          #   ~~Express + SSE~~
 ├── tests/
-│   ├── unit/                  # 单元测试（mock LLM，零网络依赖）
-│   │   ├── agent-loop.test.ts
-│   │   ├── guardrails.test.ts
-│   │   ├── feedback.test.ts
-│   │   ├── tools.test.ts
-│   │   ├── memory.test.ts
-│   │   └── credentials.test.ts
-│   └── integration/           # 集成测试（需 DeepSeek API key）
-│       └── harness.test.ts
+│   └── unit/                  # 单元测试（mock LLM，零网络依赖，无 integration/）
+│       ├── agent-loop.test.ts / agent-loop-continue.test.ts
+│       ├── guardrails-engine.test.ts / hitl.test.ts / scope-fence.test.ts / fingerprint.test.ts
+│       ├── feedback.test.ts / builtin-tools.test.ts / tools.test.ts
+│       ├── memory.test.ts / context.test.ts / llm.test.ts
+│       ├── credentials.test.ts / config.test.ts / env.test.ts
+│       ├── cli.test.ts / chat-repl.test.ts
+│       └── mechanism-demo.test.ts  # 机制演示（SPEC §A.6）
 ├── package.json
 ├── .harnessrc.json            # 默认配置模板
 ├── Dockerfile
@@ -694,7 +691,7 @@ docker run -it --rm -v $(pwd):/workspace ai4se-harness run "你的任务"
 | 2 | Agent 主循环 | 在 mock LLM 下执行一次完整 3 轮循环 → `expect(mockLLM.history.length).toBe(3)` → agent 最终返回完成状态 |
 | 3 | 工具系统 | 5 个工具全部注册 → JSON Schema 校验拒绝非法参数 → `execute_shell("ls")` 正确返回 stdout |
 | 4 | 护栏硬黑名单 | `execute_shell("rm -rf /")` → 抛出 `GuardrailViolation` → 未执行 |
-| 5 | HITL 审批 | `write_file("/etc/hosts")` → 触发 HITL → `POST /hitl/:id/approve` → 执行成功 |
+| 5 | HITL 审批 | `write_file("/etc/hosts")` → 触发 HITL → 交互式输入 `A` 批准 → 执行成功（无人值守模式自动拒绝） |
 | 6 | 反馈闭环 | 注入 `"FAIL: 3/5 tests"` → 分类为 `TEST_FAILURE` → agent 下一轮消息中看到反馈文本 |
 | 7 | 配置加载 | 删除 `.harnessrc.json` → 使用默认配置运行 → 配置错误（如无效正则）→ 启动时报错退出 |
 | 8 | 一键测试 | `npm test` 或 `make test` 运行全部单元测试且全绿（零网络依赖） |
