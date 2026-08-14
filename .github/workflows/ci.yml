@@ -24,3 +24,13 @@ jobs:
 
       - name: 运行单元测试
         run: npm test
+
+  docker-build:
+    name: 构建 Docker 镜像
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 构建镜像
+        run: docker build -t ai4se-harness .

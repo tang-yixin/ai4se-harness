@@ -16,7 +16,7 @@
  */
 
 import { Command } from 'commander';
-import { existsSync, writeFileSync, realpathSync } from 'fs';
+import { existsSync, writeFileSync, realpathSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { createInterface, type Interface } from 'readline';
@@ -453,18 +453,91 @@ function buildDefaultConfigTemplate(): string {
 }
 
 /**
+ * 解析 .env 文本内容为 key-value 映射（纯函数，供单元测试与复用）。
+ *
+ * 支持格式：
+ *   KEY=VALUE
+ *   KEY="value" / KEY='value'（可选成对引号）
+ *   # 整行注释、空行（跳过）
+ *   值内可含 '='（取第一个 '=' 之后全部作为值）
+ *
+ * @param content .env 文件的原始文本
+ * @returns key → value 映射（不含注释与空行）
+ */
+export function parseEnvContent(content: string): Record<string, string> {
+  const result: Record<string, string> = {};
+
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex <= 0) continue;
+
+    const key = trimmed.slice(0, eqIndex).trim();
+    let value = trimmed.slice(eqIndex + 1).trim();
+
+    // 去掉可选的首尾引号（成对出现时）
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    if (key.length > 0) {
+      result[key] = value;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * 从 .env 文件加载环境变量（已存在的环境变量优先，不覆盖）。
+ *
+ * 文件不存在或读取失败时静默忽略，不阻塞 CLI 启动。
+ * 默认路径为当前工作目录下的 ./.env（即运行 harness 的目录，而非安装目录）。
+ * 导出供测试使用（与 createProgram / runChatRepl 同类，非 CLI 公共 API）。
+ *
+ * @param path .env 文件路径，默认 './.env'
+ */
+export function loadEnvFile(path: string = './.env'): void {
+  if (!existsSync(path)) {
+    return;
+  }
+
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf-8');
+  } catch {
+    return; // 读取失败静默忽略
+  }
+
+  for (const [key, value] of Object.entries(parseEnvContent(raw))) {
+    // 已存在的环境变量优先（如 Docker -e / CI secrets / 命令行 export）
+    if (env[key] === undefined) {
+      env[key] = value;
+    }
+  }
+}
+
+/**
  * 解析 API key。
  *
  * 优先级：
  *   1. DEEPSEEK_API_KEY 环境变量（Docker / CI / 自动化场景）
- *   2. 交互式输入主密码，从 ~/.ai4se-harness/credentials.enc 解密
+ *   2. ./.env 文件中的 DEEPSEEK_API_KEY（本地开发便利来源，不覆盖环境变量）
+ *   3. 交互式输入主密码，从 ~/.ai4se-harness/credentials.enc 解密
  *
  * 主密码最多重试 MAX_PASSWORD_RETRIES 次。
  *
  * @returns API key 明文；如果凭据文件不存在且无环境变量则返回 null
  */
 async function resolveApiKey(): Promise<string | null> {
-  // 优先使用环境变量
+  // 先加载 .env（不覆盖已存在的环境变量），再优先使用环境变量
+  loadEnvFile();
+
   const envKey = env['DEEPSEEK_API_KEY'];
   if (envKey) {
     return envKey;

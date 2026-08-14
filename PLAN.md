@@ -1,5 +1,7 @@
 # Coding Agent Harness 实现计划
 
+> **Task 完成状态说明**：本 PLAN 中的 checkbox 仅作计划阶段占位；各 task 的实际完成状态、commit hash 与人工干预记录统一维护在 [`AGENT_LOG.md`](./AGENT_LOG.md)（含实现 checklist），以 AGENT_LOG 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 构建一个完整的 Coding Agent Harness——从 LLM 抽象层到 CLI 工具，核心机制用确定性代码实现，所有模块用 mock LLM 做单元测试。

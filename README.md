@@ -20,7 +20,11 @@
 
 ## 安装
 
-> 注意：本项目**尚未发布到 npm**，需从源码构建安装。
+两种方式任选其一：
+
+**方式一（最快）：Docker 公开镜像** —— 已发布到 `ghcr.io/tang-yixin/ai4se-harness`，无需本地装 Node / 依赖，见 [Docker 章节](#docker)。
+
+**方式二：从源码构建**（本项目尚未发布到 npm）：
 
 ```bash
 git clone <仓库地址> ai4se-harness
@@ -61,10 +65,17 @@ harness run "用 TypeScript 写一个快速排序函数并附单元测试"
 harness chat
 ```
 
-也可以不落盘、直接通过环境变量传入 key（适用于 Docker / CI / 自动化）：
+也可以不落盘、通过环境变量传入 key。本地开发推荐用 `.env` 文件（放在运行 harness 的目录，已加入 `.gitignore`）：
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...
+echo 'DEEPSEEK_API_KEY=sk-...' > .env
+harness run "你的任务"
+```
+
+Docker / CI 场景则直接注入环境变量：
+
+```bash
+export DEEPSEEK_API_KEY=sk-...   # 注意：export 会进入 shell history
 harness run "你的任务"
 ```
 
@@ -91,7 +102,8 @@ harness run "你的任务"
 API key 的解析优先级：
 
 1. `DEEPSEEK_API_KEY` 环境变量（Docker / CI / 自动化）
-2. 交互式输入主密码，从 `credentials.enc` 解密（最多重试 3 次）
+2. `.env` 文件中的 `DEEPSEEK_API_KEY`（本地开发，不覆盖已存在的环境变量）
+3. 交互式输入主密码，从 `credentials.enc` 解密（最多重试 3 次）
 
 **安全边界**：本项目假设操作系统用户空间可信，不防御内核级攻击、硬件 keylogger、物理访问，也不防进程内存 dump（明文 key 在内存中）。
 
@@ -205,26 +217,42 @@ ai4se-harness/
 ## 测试
 
 ```bash
-npm test             # vitest run，492 个用例，零网络依赖（使用 MockLLMProvider）
+npm test             # vitest run，505 个用例，零网络依赖（使用 MockLLMProvider）
 npx tsc --noEmit     # 类型检查
 ```
 
 > 说明：本项目没有 `tests/integration/`（真实 DeepSeek API key 的集成测试无法在 CI 零网络依赖下运行）。端到端集成由 `tests/unit/agent-loop*.test.ts` 用 `MockLLMProvider` 串联全部模块承担。
 
-## Docker
+### 机制演示（SPEC §A.6）
+
+用 mock LLM 确定性复现三个核心机制，可单独运行：
 
 ```bash
-# 构建镜像
-docker build -t ai4se-harness .
+npx vitest run tests/unit/mechanism-demo.test.ts
+```
 
+覆盖：① 硬黑名单拦截危险命令（`BLACKLIST BLOCK`）② 注入失败 → 反馈闭环回灌 `[FEEDBACK]` → agent 下一轮收到反馈 ③ 范围围栏硬拒绝越界写（`SCOPE FENCE BLOCK`）。
+
+## Docker
+
+镜像已发布到 GitHub Container Registry（公开），可直接拉取运行、无需本地构建：
+
+```bash
 # 验证
-docker run --rm ai4se-harness --version
+docker run --rm ghcr.io/tang-yixin/ai4se-harness:latest --version
 
 # 运行任务：挂载工作目录，并通过环境变量传入 API key
 docker run --rm \
   -v "$(pwd)":/workspace \
   -e DEEPSEEK_API_KEY=sk-... \
-  ai4se-harness run "你的任务"
+  ghcr.io/tang-yixin/ai4se-harness:latest run "你的任务"
+```
+
+本地构建（开发 / 二次修改时）：
+
+```bash
+docker build -t ai4se-harness .
+docker run --rm ai4se-harness --version
 ```
 
 容器内通过 `-e DEEPSEEK_API_KEY=...` 传入 key（环境变量有明文风险，但 Docker 内运行相对隔离）；也可进入容器执行 `harness setup` 交互录入。
