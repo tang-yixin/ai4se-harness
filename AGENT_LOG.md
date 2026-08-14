@@ -740,3 +740,25 @@ Task：Task 15 - 集成测试 + Docker + README（纯交付面，无单测代码
 
 Commit Hash: `f4ef035`
 
+---
+
+### 🔧 跨平台修复：范围围栏 Windows 路径识别失效（CI Linux 失败）
+
+时间：2026-08-14  
+涉及分支：`task/15-integration-docker`  
+CI 问题：GitHub Actions（`ubuntu-latest`）跑 `tests/unit/scope-fence.test.ts` 有 **3 个用例失败**——Windows 风格父目录穿越（`..\`）、其他盘符绝对路径（`D:\secret\...`）、`echo x > C:\Windows\...` 均被误判为「允许」。本地 Windows 全绿未暴露。
+
+**根因：** `scope-fence.ts` 用平台 `path` 模块（`resolve`/`isAbsolute`/`relative`/`sep`）做越界判断，这些 API 是平台相关的：Linux 上不识别反斜杠分隔符（把 `..\..\Windows` 当字面量文件名）和盘符（把 `D:\secret` 当相对路径），导致 Windows 风格越界路径被放行。这是真实护栏漏洞——护栏必须能识别 Windows 风格越界，无论跑在哪个平台。
+
+**修复（`src/guardrails/scope-fence.ts`）：** 路径判定平台无关化：
+1. 反斜杠统一为正斜杠
+2. 显式识别盘符绝对路径（`^[A-Za-z]:[\\/]`）
+3. 盘符不一致（含「目标有盘符、工作区无盘符」）→ 直接拒绝
+4. 盘符一致时，剥离盘符后用 `path.posix.relative` 判越界
+
+公共接口不变（`validatePath`/`validateShellCommand`/`getWorkspaceRoot` 签名与返回结构不变），`getWorkspaceRoot()` 仍返回平台原生格式（保住既有断言）。
+
+**验证（双平台）：** 本地 Windows 与 Docker Linux（`node:22-alpine`，模拟 CI）均 `npx tsc --noEmit` 零错误、`npm test` **492/492** 全绿，之前失败的 3 个用例在 Linux 上全部通过。
+
+Commit Hash: `（scope-fence.ts 待提交）`
+
