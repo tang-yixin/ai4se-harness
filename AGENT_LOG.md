@@ -33,48 +33,6 @@
 
 ## Phase 2: 实现阶段
 
-> **格式说明**：每个 task 完成后记一条。以下为示例格式，实际内容在 task 完成后填写。
-
----
-
-### 📋 Task N 示例（无错版）
-
-时间：2026-08-07 15:00  
-Task：Task 1 - LLM 抽象层  
-分支：`task/1-llm-abstraction`  
-做了什么：实现 LLMProvider 接口 + MockLLMProvider + DeepSeekProvider  
-Commit Hash: `abc1234`
-
----
-
-### 📋 Task N 示例（agent 出错版）
-
-
-时间：2026-08-07 17:00  
-Task：Task 4 - 工具系统  
-分支：`task/4-tool-system`  
-Agent做了什么：实现了 ToolRegistry + ToolDispatcher，但参数校验只写了 required 检查，漏了 type 检查。MockLLM history 忘了 push。  
-我改了什么：
-- 在 `ToolDispatcher.validateParams` 里补了 string/number 类型校验
-- 在 `MockLLMProvider.complete()` 里补了 `this.history.push(...)`
-
-教训：工具类的 task 要在 prompt 里明确列出所有校验维度（required + type + 范围），不然 agent 只会写最简单的 happy path  
-Commit Hash: 
-
----
-
-### 📋 Task N 示例（agent 完全搞错方向）
-
-时间：2026-08-08 10:00  
-Task：Task 12 - Agent 主循环  
-分支：   
-Agent做了什么：把主循环写成了一个递归函数，根本没有停机判断，LLM 的 tool_calls 被忽略直接跳过  
-处理：放弃这个 subagent 的输出，重新写了一版 prompt，强调了"while 循环 + 显式 break 条件"，第二个 agent 产出合格  
-教训：AgentLoop 这种核心模块，prompt 里必须把流程图附上。第一个 prompt 只给了文字描述，agent 根本没理解循环结构  
-Commit Hash: 
-
----
-
 ### 📋 实现 checklist
 
 - [x] Task 0: 项目脚手架与核心类型

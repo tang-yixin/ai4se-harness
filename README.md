@@ -270,4 +270,11 @@ docker run --rm ai4se-harness --version
 
 ## 许可证
 
-MIT
+本项目采用 [MIT License](./LICENSE)。
+
+第三方依赖及其许可证（详见各自包的 LICENSE 文件）：
+
+| 依赖 | 用途 | 许可证 |
+|------|------|--------|
+| `commander` | CLI 参数解析 | MIT |
+| `openai` | LLM API SDK | Apache-2.0 |
