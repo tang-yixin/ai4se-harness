@@ -6,11 +6,18 @@
  *   2. 主机白名单校验：确保 execute_shell 中的网络请求目标主机在白名单中
  *
  * 这是纯确定性逻辑，不依赖任何 LLM 判断。
- * 所有路径比较在 resolve() 后的绝对路径上进行，防止 .. 穿越和符号链接规避。
+ *
+ * 路径比较采用「平台无关」策略：先把 Windows 反斜杠统一为正斜杠、显式识别
+ * 盘符绝对路径（C:\... / D:/...），再在纯 POSIX 语义下用 posix.relative 判断
+ * 是否越界。这样无论 harness 跑在 Linux / macOS / Windows，都能一致地识别并
+ * 拦截两种风格的父目录穿越（../ 与 ..\）以及跨盘符绝对路径。
  */
 
 import type { ScopeFence } from '../core/types.js';
-import { resolve, isAbsolute, relative, sep } from 'path';
+import { resolve, posix } from 'path';
+
+/** Windows 盘符绝对路径（C:\... / D:/...） */
+const WIN_DRIVE_RE = /^([A-Za-z]):[\\/](.*)$/;
 
 // ============================================================
 // 校验结果接口
@@ -25,12 +32,79 @@ export interface FenceResult {
 }
 
 // ============================================================
+// 平台无关的路径解析辅助
+// ============================================================
+
+/** 解析后的绝对路径表示：盘符（小写或 null）+ POSIX 绝对路径 */
+interface ParsedPath {
+  /** Windows 盘符（小写），无盘符为 null */
+  drive: string | null;
+  /** 盘符后的 POSIX 绝对路径（如 /Users/dev/project） */
+  path: string;
+}
+
+/**
+ * 将工作区根解析为平台无关的 (盘符, 绝对路径)。
+ *
+ * - 盘符绝对路径（C:\...）直接识别，避免被 Linux 的 resolve 破坏盘符语义
+ * - 非盘符路径用平台 resolve 绝对化（保证 . → 工作目录），再归一化正斜杠，
+ *   并剥离 Windows 上 resolve 可能引入的盘符（resolve('.') 在 Windows 上返回 C:\...）
+ */
+function parseRoot(raw: string): ParsedPath {
+  const slash = raw.replace(/\\/g, '/');
+  const m = slash.match(WIN_DRIVE_RE);
+  if (m) {
+    return { drive: m[1].toLowerCase(), path: '/' + m[2] };
+  }
+  const abs = resolve(raw).replace(/\\/g, '/');
+  const am = abs.match(WIN_DRIVE_RE);
+  if (am) {
+    return { drive: am[1].toLowerCase(), path: '/' + am[2] };
+  }
+  return { drive: null, path: abs };
+}
+
+/**
+ * 将目标路径解析为 (盘符, 绝对路径)，相对路径以 rootPath 为基准解析。
+ */
+function parseTarget(
+  raw: string,
+  rootDrive: string | null,
+  rootPath: string,
+): ParsedPath {
+  const slash = raw.replace(/\\/g, '/');
+  const m = slash.match(WIN_DRIVE_RE);
+  if (m) {
+    return { drive: m[1].toLowerCase(), path: '/' + m[2] };
+  }
+  if (slash.startsWith('/')) {
+    // POSIX 绝对路径；在 Windows 盘符工作区语义下表示「当前盘符根」
+    return { drive: rootDrive, path: slash };
+  }
+  return { drive: rootDrive, path: posix.resolve(rootPath, slash) };
+}
+
+/**
+ * 判断 POSIX 绝对路径 target 是否在 root 之外（越界）。
+ */
+function isOutside(root: string, target: string): boolean {
+  const rel = posix.relative(root, target);
+  return rel === '..' || rel.startsWith('../') || posix.isAbsolute(rel);
+}
+
+// ============================================================
 // ScopeFenceGuard
 // ============================================================
 
 export class ScopeFenceGuard {
-  /** 解析后的工作区根目录（绝对路径） */
+  /** 平台格式的工作区根目录（getWorkspaceRoot 返回，保留平台原生路径形式） */
   private workspaceRoot: string;
+
+  /** 工作区根盘符（小写）；非盘符为 null */
+  private rootDrive: string | null;
+
+  /** 工作区根盘符后的 POSIX 绝对路径（用于平台无关越界判定） */
+  private rootPath: string;
 
   /** 允许访问的主机白名单（裸主机名，不含协议和端口） */
   private allowedHosts: string[];
@@ -45,6 +119,10 @@ export class ScopeFenceGuard {
     this.workspaceRoot = resolve(config.workspaceRoot);
     this.allowedHosts = [...config.allowedHosts];
     this.maxShellTimeMs = config.maxShellTimeMs;
+
+    const root = parseRoot(config.workspaceRoot);
+    this.rootDrive = root.drive;
+    this.rootPath = root.path;
   }
 
   // ============================================================
@@ -54,13 +132,13 @@ export class ScopeFenceGuard {
   /**
    * 校验给定的文件路径是否在工作区根目录内。
    *
-   * 校验逻辑：
+   * 校验逻辑（平台无关）：
    *   1. 空/空白路径 → 拒绝
-   *   2. 将目标路径解析为绝对路径
-   *   3. 计算相对路径（从 workspaceRoot 到目标）
-   *   4. 如果相对路径以 .. 开头或为绝对路径 → 拒绝（越界）
+   *   2. 归一化分隔符（\ → /）并识别盘符绝对路径
+   *   3. 盘符不一致（含「目标有盘符、工作区无盘符」或反之）→ 拒绝
+   *   4. 盘符一致时，用 POSIX 语义判断盘符后路径是否越界
    *
-   * @param targetPath 要校验的文件路径（可以是相对或绝对路径）
+   * @param targetPath 要校验的文件路径（相对/绝对，POSIX 或 Windows 风格）
    * @returns 校验结果
    */
   validatePath(targetPath: string): FenceResult {
@@ -72,23 +150,14 @@ export class ScopeFenceGuard {
       };
     }
 
-    // 解析为绝对路径
-    const resolved = this.resolveTarget(targetPath);
+    const target = parseTarget(targetPath.trim(), this.rootDrive, this.rootPath);
 
-    // 计算从工作区根目录到目标路径的相对路径
-    const rel = relative(this.workspaceRoot, resolved);
+    if (target.drive !== this.rootDrive) {
+      return this.deny(targetPath);
+    }
 
-    // 越界判定：
-    //   - Unix: 相对路径以 ".." 开头或以 "../" 开始 → 在工作区外
-    //   - Windows: 相对路径以 ".." 开头 → 在工作区外
-    //   - 绝对路径: relative 返回绝对路径 → 目标在其他盘符（Windows: D:\...）
-    if (rel.startsWith('..' + sep) || rel === '..' || isAbsolute(rel)) {
-      return {
-        allowed: false,
-        reason: `路径 "${targetPath}" 解析后在工作区根目录 "${
-          this.workspaceRoot
-        }" 之外。`,
-      };
+    if (isOutside(this.rootPath, target.path)) {
+      return this.deny(targetPath);
     }
 
     return { allowed: true };
@@ -220,6 +289,16 @@ export class ScopeFenceGuard {
   // 私有方法
   // ============================================================
 
+  /** 构造路径越界的拒绝结果 */
+  private deny(targetPath: string): FenceResult {
+    return {
+      allowed: false,
+      reason: `路径 "${targetPath}" 解析后在工作区根目录 "${
+        this.workspaceRoot
+      }" 之外。`,
+    };
+  }
+
   /**
    * 从 shell 命令字符串中提取所有输出目标路径。
    *
@@ -265,20 +344,6 @@ export class ScopeFenceGuard {
     }
 
     return paths;
-  }
-
-  /**
-   * 将目标路径解析为绝对路径。
-   *
-   * 如果目标路径已经是绝对路径，直接返回。
-   * 如果是相对路径，以 workspaceRoot 为基准解析。
-   */
-  private resolveTarget(targetPath: string): string {
-    if (isAbsolute(targetPath)) {
-      return resolve(targetPath); // normalize 斜杠等
-    }
-    // 相对路径 → 以 workspaceRoot 为基准解析
-    return resolve(this.workspaceRoot, targetPath);
   }
 
   /**

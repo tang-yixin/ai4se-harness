@@ -16,7 +16,7 @@
  */
 
 import { Command } from 'commander';
-import { existsSync, writeFileSync } from 'fs';
+import { existsSync, writeFileSync, realpathSync } from 'fs';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { createInterface, type Interface } from 'readline';
@@ -606,20 +606,23 @@ function isEntryPoint(): boolean {
   if (!entryArg) return false;
 
   const currentFile = fileURLToPath(import.meta.url);
-  const normalizedEntry = resolve(entryArg);
-  const normalizedCurrent = resolve(currentFile);
 
-  // 精确匹配（经 resolve 规范化）
-  if (normalizedEntry === normalizedCurrent) return true;
-
-  // 跨平台后缀匹配
-  return (
-    entryArg.endsWith('/cli/index.js')
-    || entryArg.endsWith('\\cli\\index.js')
-    || entryArg.endsWith('/cli/index.ts')
-    || entryArg.endsWith('\\cli\\index.ts')
-    || entryArg.includes('cli/index')
-  );
+  // 用 realpath 解析符号链接后做精确比较。
+  // 经 npm 全局安装的 `harness` 是符号链接（/usr/local/bin/harness → dist/cli/index.js），
+  // 直接比较 argv[1] 与 import.meta.url 会因 symlink 名不同而误判为「非入口」，
+  // 导致 CLI 静默退出。解析到真实路径后二者才能正确相等。
+  try {
+    return realpathSync(entryArg) === realpathSync(currentFile);
+  } catch {
+    // realpath 失败（如文件尚不存在）→ 回退到跨平台后缀匹配
+    return (
+      entryArg.endsWith('/cli/index.js')
+      || entryArg.endsWith('\\cli\\index.js')
+      || entryArg.endsWith('/cli/index.ts')
+      || entryArg.endsWith('\\cli\\index.ts')
+      || entryArg.includes('cli/index')
+    );
+  }
 }
 
 // 仅在作为 CLI 入口点运行时解析命令
