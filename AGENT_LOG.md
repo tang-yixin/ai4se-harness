@@ -710,3 +710,33 @@ Commit Hash: `ff25f20`
 
 Commit Hash: `24bafef`
 
+---
+
+### 📋 Task 15 完成
+
+时间：2026-08-14  
+Task：Task 15 - 集成测试 + Docker + README（纯交付面，无单测代码）  
+分支：`task/15-integration-docker`  
+做了什么：交付 Dockerfile、`.dockerignore`、README.md、`.github/workflows/ci.yml`；并顺手修复 `isEntryPoint()` 在 npm 全局 symlink 下 CLI 静默退出的 bug（改 `src/cli/index.ts`，超出 PLAN Files 列表，经用户授权）。
+
+**交付物要点：**
+- `Dockerfile` — 本地构建（`npm ci` → `npm run build` → `npm install -g .`），构建目录 `/app` 与运行时挂载点 `/workspace` 分离，避免 `-v $(pwd):/workspace` 覆盖构建产物；`ENTRYPOINT ["harness"]`
+- `.dockerignore` — 排除 node_modules / dist / .git / tests 及本地配置与日志（PLAN 外新增文件）
+- `.github/workflows/ci.yml` — push/PR 触发，`npm ci` → `npx tsc --noEmit` → `npm test`，Node 22 + `cache: npm`（对应 SPEC 验收 #9）
+- `README.md` — 按实际实现撰写：5 个子命令、凭据在 `~/.ai4se-harness/credentials.enc`、纯内存记忆、确定性滑动窗口压缩、`llm.maxTokens=8192`、真实目录结构、如实写已知限制
+
+**关键修复（`src/cli/index.ts` 的 `isEntryPoint()`）：**
+- 根因：npm 全局 bin 是符号链接（`/usr/local/bin/harness` → `dist/cli/index.js`），经 symlink 执行时 `process.argv[1]` 是 bin 名而非真实脚本路径，旧逻辑匹配不到 `cli/index` → `createProgram().parse()` 不执行 → CLI 静默退出（本地 Windows 用 `.cmd` 包装脚本故未暴露，Docker/Linux 暴露）
+- 修复：改用 `realpathSync()` 解析符号链接后比较真实路径（保留 try/catch 回退到原后缀匹配）
+
+**验证：**
+- `npx tsc --noEmit` 零错误；`npm test` **492/492** 全绿
+- `docker build -t ai4se-harness .` 成功（实测）；`docker run --rm ai4se-harness --version` → `1.0.0`，`--help` → 正常列出 4 命令
+
+**审核改进回应（3 条）：**
+1. 「README 配置示例与 setup 生成规则不一致（6 条 vs 3 条）」——经核实为**误报**：`buildDefaultConfigTemplate()` 实际只生成 3 条，审核者把代码内置的 `blacklist.ts`/`engine.ts` 启发式规则误当配置规则；已在 README 加注区分「用户可编辑规则」与「代码内置防护」
+2. 「集成测试未交付」——合理省略（真实 key 无法在 CI 零网络下运行），README 测试节已注明端到端由 mock LLM 承担
+3. 「Docker build 未验证」——已本地安装 Docker 并实测通过
+
+Commit Hash: `f4ef035`
+
